@@ -3099,6 +3099,10 @@ class DeprecatedCustomTransformsTest(jtu.JaxTestCase):
     b = np.dot(a + np.eye(a.shape[0]), real_x)
     print(gf(a, b))  # doesn't crash
 
+  def test_named_call_static_argnums(self):
+    f = api.named_call(lambda x, y: y if x else None, name='test')
+    out = jit(f, static_argnums=(0,))(True, 5)
+    self.assertEqual(out, 5)
 
 if __name__ == '__main__':
   absltest.main()

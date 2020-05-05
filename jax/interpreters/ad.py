@@ -557,6 +557,8 @@ def call_transpose(primitive, params, call_jaxpr, args, ct):
   return tree_unflatten(out_tree(), out_flat)
 primitive_transposes[core.call_p] = partial(call_transpose, call_p)
 primitive_transposes[pe.remat_call_p] = partial(call_transpose, pe.remat_call_p)
+primitive_transposes[core.named_call_p] = partial(call_transpose,
+                                                  core.named_call_p)
 
 def map_transpose(primitive, params, call_jaxpr, args, ct):
   all_args, in_tree_def = tree_flatten(((), args, ct))  # empty consts

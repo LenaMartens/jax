@@ -1861,3 +1861,19 @@ def custom_gradient(fun):
   primal_fun = custom_transforms(primal_fun)
   defvjp_all(primal_fun, fun)
   return primal_fun
+
+
+def named_call(fun: Callable[..., Any], *, name: str) -> Callable[..., Any]:
+  """Wraps a function in a name_scope with the provided name."""
+  def named_fun(*args, **kwargs):
+    f = lu.wrap_init(fun)
+    flat_args, in_tree = tree_flatten((args, kwargs))
+    # flat_f is a version of f that takes a flat sequence of args and returns
+    # a flat sequence of results.
+    flat_f, out_tree = flatten_fun(f, in_tree)
+
+    out_flat = core.named_call(flat_f, *flat_args, name=name)
+
+    # pack the flat result back into the same structure fun would have returned
+    return tree_unflatten(out_tree(), out_flat)
+  return named_fun

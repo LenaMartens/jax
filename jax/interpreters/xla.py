@@ -621,15 +621,30 @@ pe.staged_out_calls.add(xla_call_p)
 def _xla_call_translation_rule(c, axis_env,
                                in_nodes, name_stack, backend, name,
                                call_jaxpr, device=None):
-  del device  # Ignored.
-  subc = xb.make_computation_builder(f"jit_{name}")
-  args = [xb.parameter(subc, i, c.GetShape(n)) for i, n in enumerate(in_nodes)]
-  out_nodes = jaxpr_subcomp(subc, call_jaxpr, backend, axis_env, (),
-                            extend_name_stack(name_stack, wrap_name(name, 'jit')), *args)
-  subc = subc.Build(xops.Tuple(subc, out_nodes))
-  return xops.Call(c, subc, list(in_nodes))
+  del device # not used
+  return _named_call_translation_rule(c, axis_env, in_nodes, name_stack,
+                                      backend, wrap_name(name, 'jit'),
+                                      call_jaxpr)
 ad.primitive_transposes[xla_call_p] = partial(ad.call_transpose, xla_call_p)
 
+
+def _named_call_translation_rule(comp_builder: "xc.XlaBuilder",
+                                 axis_env: AxisEnv,
+                                 in_nodes,
+                                 name_stack: str,
+                                 backend: Optional[Any],
+                                 name: str,
+                                 call_jaxpr: core.Jaxpr):
+  """Compile and add a custom name to the XLA metadata."""
+  subcomp_builder = xb.make_computation_builder(f"named_call_{name}")
+  args = [xb.parameter(subcomp_builder, i, comp_builder.GetShape(n))
+          for i, n in enumerate(in_nodes)]
+  out_nodes = jaxpr_subcomp(subcomp_builder, call_jaxpr,
+                            backend, axis_env, (),
+                            extend_name_stack(name_stack, name),
+                            *args)
+  subcomp = subcomp_builder.Build(xops.Tuple(subcomp_builder, out_nodes))
+  return xops.Call(comp_builder, subcomp, list(in_nodes))
 
 ### translation tables
 
@@ -641,6 +656,7 @@ backend_specific_translations: Dict[str, Dict[core.Primitive, Callable]] = defau
 
 translations[core.identity_p] = lambda c, x: x
 call_translations[xla_call_p] = _xla_call_translation_rule
+call_translations[core.named_call_p] = _named_call_translation_rule
 
 def zeros_like_translation_rule(c, x):
   shape = c.GetShape(x)
