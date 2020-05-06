@@ -1035,6 +1035,19 @@ call = partial(call_bind, call_p)
 call_p.def_custom_bind(call)
 call_p.def_impl(call_impl)
 
+# -------------------named_call-------------------
+
+# Registering named call as a primitive
+named_call_p = Primitive("named_call")
+# A call_primitive is a higher order primitive
+named_call_p.call_primitive = True
+named_call_p.def_custom_bind(partial(call_bind, named_call_p))
+# named_call is implemented as a plain call and only diverges
+# under compilation (see named_call_translation_rule)
+named_call_p.def_impl(call_impl)
+named_call_p.multiple_results = True
+
+named_call = named_call_p.bind
 
 # ------------------- Jaxpr printed representation -------------------
 
