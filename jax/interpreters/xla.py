@@ -74,18 +74,21 @@ def identity(x): return x
 _scalar_types = dtypes.python_scalar_dtypes.keys()
 
 # unit representation
-def _make_unit(c): return xb.constant(c, np.zeros((), dtype=np.dtype('bool')))
-def _make_abstract_unit(_): return xc.Shape.array_shape(np.dtype('bool'), ())
+def _make_unit_constant(c): return xb.constant(c, np.zeros((), dtype=np.dtype('bool')))
+def _make_unit_shape(_): return xc.Shape.array_shape(np.dtype('bool'), ())
 def _device_put_unit(_, device):
   backend = xb.get_device_backend(device)
   return backend.buffer_from_pyval(np.zeros((), dtype=np.dtype('bool')),
                                    device)
 def _make_array_shape(a):
-  return xc.Shape.array_shape(a.dtype, a.shape)
+  if a.dtype is dtypes.float0:
+    return xc.Shape.array_shape(np.dtype('bool'), ())
+  else:
+    return xc.Shape.array_shape(a.dtype, a.shape)
 
 ### handlers
 
-xb.register_constant_handler(core.Unit, lambda c, *_: _make_unit(c))
+xb.register_constant_handler(core.Unit, lambda c, *_: _make_unit_constant(c))
 
 def aval_to_xla_shape(aval):
   try:
@@ -94,7 +97,7 @@ def aval_to_xla_shape(aval):
     raise TypeError(f"No xla_shape_handler for type: {type(aval)}") from err
 
 xla_shape_handlers: Dict[Type[core.AbstractValue], Callable] = {
-    core.AbstractUnit: _make_abstract_unit,
+    core.AbstractUnit: _make_unit_shape,
     ShapedArray: _make_array_shape,
     ConcreteArray: _make_array_shape,
 }
@@ -106,10 +109,12 @@ def aval_to_result_handler(device: Optional[Device], aval: core.ShapedArray):
     raise TypeError(f"No xla_result_handler for type: {type(aval)}") from err
 
 def array_result_handler(device: Optional[Device], aval: core.ShapedArray):
+  if aval.dtype is dtypes.float0:
+    return lambda _: np.zeros(aval.shape, dtypes.float0)
   return partial(DeviceArray, raise_to_shaped(aval), device, lazy.array(aval.shape))
 
 xla_result_handlers: Dict[Type[core.AbstractValue], Callable[..., Callable]] = {
-    core.AbstractUnit: lambda _, __: lambda _: core.unit,
+    core.AbstractUnit: lambda device, aval: lambda _: core.unit,
     ShapedArray: array_result_handler,
     ConcreteArray: array_result_handler,
 }
@@ -123,6 +128,8 @@ def device_put(x, device: Optional[Device] = None):
 
 def _device_put_array(x, device: Optional[Device]):
   backend = xb.get_device_backend(device)
+  if x.dtype is dtypes.float0:
+    x = np.zeros((), dtype=np.dtype(bool))
   return backend.buffer_from_pyval(x, device)
 
 def _device_put_scalar(x, device):
@@ -391,7 +398,7 @@ def jaxpr_subcomp(c, jaxpr, backend, axis_env, consts, name_stack, *args):
     env[v] = node
 
   env = {}
-  write(core.unitvar, _make_unit(c))
+  write(core.unitvar, _make_unit_constant(c))
   map(write, jaxpr.constvars, consts)
   map(write, jaxpr.invars, args)
   for eqn in jaxpr.eqns:
@@ -857,7 +864,7 @@ def _tuple_output(*args, **kwargs):
   ans = yield args, kwargs
   yield (ans,)
 
-def lower_fun(fun, multiple_results):
+def lower_fun(fun, multiple_results, parallel=False):
   # This function can only be used to lower functions that take JAX array types
   # as arguments (and e.g. don't accept unit values), because it assumes it can
   # map from XLA types to JAX types. In general that mapping is not possible (as
@@ -868,10 +875,14 @@ def lower_fun(fun, multiple_results):
   def f(c, *xla_args, **params):
     # TODO(mattjj): revise this 'calling convention'
     avals = [_array_aval_from_xla_shape(c.get_shape(x)) for x in xla_args]
+    if parallel:
+      axis_env = params.pop('axis_env')
+      del params['platform']
+    else:
+      axis_env = AxisEnv(1, (), (), None)
     wrapped_fun = lu.wrap_init(fun, params)
     if not multiple_results:
       wrapped_fun = _tuple_output(wrapped_fun)
-    axis_env = AxisEnv(1, (), (), None)
     if config.omnistaging_enabled:
       jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, avals)
       outs = jaxpr_subcomp(c, jaxpr, None, axis_env, _xla_consts(c, consts), '',
@@ -1275,15 +1286,6 @@ def _call_translation_rule(c, axis_env, in_nodes, name_stack,
   subc = subc.Build(xops.Tuple(subc, out_nodes))
   return xops.Call(c, subc, list(in_nodes))
 call_translations[core.call_p] = _call_translation_rule
-
-
-def _axis_index_translation_rule(c, *, axis_name, axis_env, platform):
-  div = xb.constant(c, np.array(axis_env.nreps // prod(axis_env.sizes),
-                                dtype=np.uint32))
-  mod = xb.constant(c, np.array(axis_env.sizes[-1], dtype=np.uint32))
-  unsigned_index = xops.Rem(xops.Div(xops.ReplicaId(c), div), mod)
-  return xops.ConvertElementType(unsigned_index, xb.dtype_to_etype(np.int32))
-parallel_translations[core.axis_index_p] = _axis_index_translation_rule  # type: ignore
 
 
 @config.register_omnistaging_disabler

@@ -31,8 +31,8 @@ import numpy as np
 from . import dtypes
 from .config import FLAGS, config
 from . import linear_util as lu
-from . import source_info_util
 
+from . import source_info_util
 from .util import safe_zip, safe_map, partial, curry, prod, partialmethod
 from .pprint_util import pp, vcat, PrettyPrint
 
@@ -749,7 +749,7 @@ class AbstractValue:
   __slots__: List[str] = []
 
   def at_least_vspace(self):
-    assert False
+    return self
 
   def __repr__(self):
     try:
@@ -908,7 +908,8 @@ class UnshapedArray(AbstractValue):
   _oct     = concretization_function_error(oct)
 
   def at_least_vspace(self) -> AbstractValue:
-    return self
+    return UnshapedArray(primal_dtype_to_tangent_dtype(self.dtype),
+                         self.weak_type)
 
   def join(self, other):
     if self.dtype == other.dtype:
@@ -961,7 +962,8 @@ class ShapedArray(UnshapedArray):
     return hash((self.shape, self.dtype, self.weak_type))
 
   def at_least_vspace(self):
-    return self
+    return ShapedArray(self.shape, primal_dtype_to_tangent_dtype(self.dtype),
+                       self.weak_type)
 
   def join(self, other):
     if self.shape == other.shape and self.dtype == other.dtype:
@@ -1003,7 +1005,7 @@ class ConcreteArray(ShapedArray):
                                         weak_type=weak_type)
     # Note: canonicalized self.dtype doesn't necessarily match self.val
     self.val = val
-    assert self.dtype != np.dtype('O')
+    assert self.dtype != np.dtype('O'), val
 
   def __eq__(self, other):
     return (type(self) is type(other) and self.dtype == other.dtype
@@ -1014,7 +1016,8 @@ class ConcreteArray(ShapedArray):
     return id(self.val)
 
   def at_least_vspace(self):
-    return ShapedArray(self.shape, self.dtype, weak_type=self.weak_type)
+    return ShapedArray(self.shape, primal_dtype_to_tangent_dtype(self.dtype),
+                       weak_type=self.weak_type)
 
   def join(self, other) -> UnshapedArray:
     if self == other:
@@ -1042,6 +1045,11 @@ class ConcreteArray(ShapedArray):
   _float           = concretization_function_error(float, True)
   _complex         = concretization_function_error(complex, True)
 
+def primal_dtype_to_tangent_dtype(primal_dtype):
+  if not dtypes.issubdtype(primal_dtype, np.inexact):
+    return dtypes.float0
+  else:
+    return primal_dtype
 
 class AbstractToken(AbstractValue):
   def join(self, other):
@@ -1190,48 +1198,6 @@ def axis_frame(axis_name):
       return frame
 
   raise NameError("unbound axis name: {}".format(axis_name))
-
-def axis_index(axis_name):
-  """Return the index along the mapped axis ``axis_name``.
-
-  Args:
-    axis_name: hashable Python object used to name the mapped axis.
-
-  Returns:
-    An integer representing the index.
-
-  For example, with 8 XLA devices available:
-
-  >>> from functools import partial
-  >>> @partial(jax.pmap, axis_name='i')
-  ... def f(_):
-  ...   return lax.axis_index('i')
-  ...
-  >>> f(np.zeros(4))
-  ShardedDeviceArray([0, 1, 2, 3], dtype=int32)
-  >>> f(np.zeros(8))
-  ShardedDeviceArray([0, 1, 2, 3, 4, 5, 6, 7], dtype=int32)
-  >>> @partial(jax.pmap, axis_name='i')
-  ... @partial(jax.pmap, axis_name='j')
-  ... def f(_):
-  ...   return lax.axis_index('i'), lax.axis_index('j')
-  ...
-  >>> x, y = f(np.zeros((4, 2)))
-  >>> print(x)
-  [[0 0]
-  [1 1]
-  [2 2]
-  [3 3]]
-  >>> print(y)
-  [[0 1]
-  [0 1]
-  [0 1]
-  [0 1]]
-  """
-  return axis_index_p.bind(axis_name=axis_name)
-
-axis_index_p = Primitive('axis_index')
-axis_index_p.def_abstract_eval(lambda *, axis_name: ShapedArray((), np.int32))
 
 
 # ------------------- Jaxpr checking -------------------
@@ -1623,3 +1589,6 @@ def omnistaging_disabler() -> None:
       yield
     finally:
       trace_state.initial_style = prev
+
+# Casting float0 array to a float-valued zero array.
+zeros_like_float0 = lambda a: np.zeros(a.shape, np.float)

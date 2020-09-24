@@ -116,10 +116,18 @@ class FilteredTracebackTest(jtu.JaxTestCase):
 
     f = lambda: outermost(jnp.array([1, 2]))
 
-    check_filtered_stack_trace(self, TypeError, f, [
+    # NOTE(mattjj): after #4039, the TypeError is no longer raised in this case,
+    # so instead we check for the AssertionError
+    # check_filtered_stack_trace(self, TypeError, f, [
+    #     ('<lambda>', 'f = lambda: outermost'),
+    #     ('outermost', 'return 2 + inbetween(x)'),
+    #     ('inbetween', 'return 1 + grad(innermost)(x)')])
+
+    check_filtered_stack_trace(self, AssertionError, f, [
         ('<lambda>', 'f = lambda: outermost'),
         ('outermost', 'return 2 + inbetween(x)'),
-        ('inbetween', 'return 1 + grad(innermost)(x)')])
+        ('inbetween', 'return 1 + grad(innermost)(x)'),
+        ('innermost', 'assert False')])
 
   def test_cause_chain(self):
     if not traceback_util.filtered_tracebacks_supported():

@@ -32,7 +32,7 @@ import concurrent.futures
 
 import jax
 import jax.numpy as jnp
-from jax import jit, grad, device_put, jacfwd, jacrev, hessian
+from jax import float0, jit, grad, device_put, jacfwd, jacrev, hessian
 from jax import api, core, lax, lax_reference
 from jax.core import Primitive
 from jax.interpreters import ad
@@ -63,8 +63,9 @@ class CPPJitTest(jtu.JaxTestCase):
     # TODO(jblespiau,phawkins): Remove this when jaxlib has been released.
     # This is in the future, because we are making a breaking change to
     # Tensorflow.
-    if version < (0, 1, 54):
-      return jax.api._python_jit
+    if version < (0, 1, 56):
+      raise unittest.SkipTest("Disabled because it depends on some future "
+                              "release of jax_jit.cc within jaxlib.")
     else:
       return jax.api._cpp_jit
 
@@ -239,6 +240,7 @@ class CPPJitTest(jtu.JaxTestCase):
     self.assertDeleted(c)
     self.assertDeleted(d)
 
+  @jtu.skip_on_devices("cpu")  # In/out aliasing not supported on CPU.
   def test_jnp_array_copy(self):
     # https://github.com/google/jax/issues/3412
 
@@ -831,7 +833,7 @@ class APITest(jtu.JaxTestCase):
       lambda: api.jvp(lambda x, y: x * y, (np.float32(2),), [np.float32(2)]))
     self.assertRaisesRegex(
       TypeError,
-      "primal and tangent arguments to jax.jvp must have equal types",
+      "primal and tangent arguments to jax.jvp do not match.",
       lambda: api.jvp(lambda x: -x, (np.float16(2),), (np.float32(4),)))
 
   def test_jvp_non_tuple_arguments(self):
@@ -853,7 +855,7 @@ class APITest(jtu.JaxTestCase):
       lambda: pullback((np.float32(7), np.float32(100))))
     self.assertRaisesRegex(
       TypeError,
-      "Type of cotangent input to vjp pullback.*does not match type",
+      "Type of cotangent input to vjp pullback.*is not the expected tangent type",
       lambda: pullback((np.float16(42))))
 
   def test_jvp_jit_cached(self):
@@ -1141,12 +1143,123 @@ class APITest(jtu.JaxTestCase):
     self.assertEqual(len(subjaxpr.eqns), 1)
 
   def test_grad_of_int_errors(self):
+    raise unittest.SkipTest("after #4039 we allow grad of int")
     dfn = grad(lambda x: x ** 2)
     self.assertRaisesRegex(
       TypeError,
       (r"grad requires real- or complex-valued inputs \(input dtype that is a "
        r"sub-dtype of np.floating or np.complexfloating\), but got int.*."),
       lambda: dfn(3))
+
+  def test_jvp_of_int_identity(self):
+    primals = (1,)
+    tangents = (np.zeros(shape=(), dtype=float0),)
+
+    _, out = api.jvp(lambda x: x, primals, tangents)
+    self.assertEqual(out, np.zeros(shape=(), dtype=float0))
+
+  def test_jvp_of_int_add(self):
+    primals = (2,)
+    tangents = (np.zeros(shape=(), dtype=float0),)
+
+    _, out_tangent = api.jvp(lambda x: x+1, primals, tangents)
+    self.assertEqual(out_tangent, np.zeros(shape=(), dtype=float0))
+
+  def test_jit_jvp_of_int(self):
+    primals = (2,)
+    tangents = (np.zeros(shape=(), dtype=float0),)
+
+    _, out_tangent = api.jvp(jax.jit(lambda x: x+1), primals, tangents)
+    self.assertEqual(out_tangent, np.zeros(shape=(), dtype=float0))
+
+  def test_vjp_of_int_index(self):
+    primal, fn_vjp = api.vjp(lambda x, i: x[i], np.ones(2)*2, 1)
+    tangent_x, tangent_i = fn_vjp(1.)
+    self.assertEqual(primal, 2.)
+    self.assertAllClose(tangent_x, jnp.array([0., 1.]))
+    self.assertEqual(tangent_i, np.zeros(shape=(), dtype=float0))
+
+  def test_vjp_of_int_shapes(self):
+    out, fn_vjp = api.vjp(lambda x: lax.reshape(x, (2, 2)), np.ones((4, 1),
+                                                                    dtype=int))
+    tangent, = fn_vjp(out)
+    self.assertArraysEqual(tangent, np.zeros(shape=(4, 1), dtype=float0))
+
+  def test_custom_vjp_int(self):
+    @api.custom_vjp
+    def f(x):
+      return jnp.sin(x)
+    def f_fwd(x):
+      return f(x), jnp.cos(x)
+    def f_rev(cos_x, g):
+      return (2 * cos_x * g,)
+    f.defvjp(f_fwd, f_rev)
+
+    x = 3
+    self.assertEqual(api.grad(f, allow_int=True)(x),
+                     np.zeros(shape=(), dtype=float0))
+    self.assertEqual(api.value_and_grad(f, allow_int=True)(x),
+                     (jnp.sin(x), np.zeros(shape=(), dtype=float0)))
+
+  def test_jit_vjp_of_int(self):
+    primal, fn_vjp = api.vjp(lambda x, y: x+y, 2, 1)
+    tangent_x, tangent_i = jax.jit(fn_vjp)(1)
+    self.assertEqual(primal, 3)
+    self.assertEqual(tangent_x, np.zeros(shape=(), dtype=float0))
+    self.assertEqual(tangent_i, np.zeros(shape=(), dtype=float0))
+
+  def test_vjp_of_int_fulllike(self):
+    # Regression test for tangent and cotangent mismatch in convert_element_type
+    # transpose rule wrt a ConstVar
+    f = lax.full_like
+    out, vjp = api.vjp(f, np.zeros((2, 2)), 1)
+    self.assertAllClose(out, jnp.ones((2, 2)))
+    tangent_x, tangent_y = vjp(out)
+    self.assertAllClose(tangent_x, jnp.zeros((2, 2)))
+    self.assertEqual(tangent_y, np.zeros(shape=(), dtype=float0))
+
+  def test_grad_of_int(self):
+    # Need real-valued output, but testing integer input.
+    out = api.grad(lambda x: x+0., allow_int=True)(1)
+    self.assertEqual(out, np.zeros(shape=(), dtype=float0))
+
+  def test_grad_of_bool(self):
+    def cond(pred):
+      return lax.cond(pred, lambda _: 1., lambda _: 2., 1.)
+    value, grd = api.value_and_grad(cond, allow_int=True)(True)
+    self.assertEqual(value, 1.)
+    self.assertEqual(grd, np.zeros(shape=(), dtype=float0))
+
+  def test_grad_of_int_index(self):
+    grad_x, grad_i = api.grad(lambda x, i: x[i], argnums=(0, 1),
+                              allow_int=True)(np.ones(2), 1)
+    self.assertAllClose(grad_x, jnp.array([0., 1.]))
+    self.assertEqual(grad_i, np.zeros(shape=(), dtype=float0))
+
+  def test_jit_grad_of_int(self):
+    grad_f = api.grad(lambda x, i: x[i], argnums=(0, 1), allow_int=True)
+    grad_x, grad_i = jax.jit(grad_f)(np.ones(2), 1)
+    self.assertAllClose(grad_x, jnp.array([0., 1.]))
+    self.assertEqual(grad_i, np.zeros(shape=(), dtype=float0))
+
+  def test_float0_reshape(self):
+    float0_array = jax.grad(lambda x: jnp.sum(x+0.),
+                            allow_int=True)(np.ones((2, 4), dtype=int))
+
+    self.assertArraysEqual(float0_array.reshape((4, 2)),
+                           np.zeros((4, 2), dtype=float0))
+    self.assertArraysEqual(float0_array.transpose(),
+                           np.zeros((4, 2), dtype=float0))
+
+  def test_float0_error(self):
+    float0_array = jax.grad(lambda x: x+0., allow_int=True)(1)
+    error_text = "float0s do not support any operations by design"
+
+    with self.assertRaisesRegex(TypeError, error_text):
+      _ = float0_array + jnp.zeros(())
+
+    with self.assertRaisesRegex(TypeError, error_text):
+      _ = lax.add(float0_array, jnp.zeros(()))
 
   def test_grad_complex_result_errors(self):
     dfn = grad(lambda x: x ** 2 + 1j)
@@ -1327,6 +1440,10 @@ class APITest(jtu.JaxTestCase):
       raise unittest.SkipTest("test requires omnistaging")
     f = lambda: jax.lax.psum(1, "i")
     api.xla_computation(f, axis_env=[("i", 2)])()  # doesn't crash
+
+  @jtu.skip_on_devices("cpu", "gpu")
+  def test_xla_computation_donate_argnums(self):
+    api.xla_computation(lambda x: None, donate_argnums=(0,))(3)  # doesn't crash
 
   def test_concurrent_device_get_and_put(self):
     def f(x):
@@ -1540,7 +1657,6 @@ class APITest(jtu.JaxTestCase):
     vfoo = api.vmap(
         foo, in_axes=((0, collections.OrderedDict([('a', 1), ('b', 2)])),))
     self.assertEqual(vfoo(tree).shape, (6, 2, 5))
-
 
   def test_pmap_global_cache(self):
     def f(x):
@@ -1791,6 +1907,22 @@ class APITest(jtu.JaxTestCase):
         assert jnp.add(1, 1) == 2
 
     f()  # doesn't crash
+
+  def test_xla_computation_zeros_doesnt_device_put(self):
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test is omnistaging-specific")
+
+    count = 0
+    def device_put_and_count(*args, **kwargs):
+      nonlocal count
+      count += 1
+      return orig_device_put(*args, **kwargs)
+    orig_device_put, xla.device_put = xla.device_put, device_put_and_count
+    try:
+      api.xla_computation(lambda: jnp.zeros(3))()
+    finally:
+      xla.device_put = orig_device_put
+    self.assertEqual(count, 0)
 
 
 class RematTest(jtu.JaxTestCase):
@@ -2253,6 +2385,13 @@ class JaxprTest(jtu.JaxTestCase):
 
     jaxpr = api.make_jaxpr(f, static_argnums=(1,))(2, 3)
     self.assertIn('3', str(jaxpr))
+
+  def test_make_jaxpr_return_shape(self):
+    _, shape_tree = api.make_jaxpr(lambda x: (x + 1, jnp.zeros(2, jnp.float32)),
+                                   return_shape=True)(np.int32(1))
+    expected = (api.ShapeDtypeStruct(shape=(), dtype=jnp.int32),
+                api.ShapeDtypeStruct(shape=(2,), dtype=jnp.float32))
+    self.assertEqual(shape_tree, expected)
 
 
 class LazyTest(jtu.JaxTestCase):
@@ -3431,7 +3570,6 @@ class InvertibleADTest(jtu.JaxTestCase):
                         check_dtypes=True)
 
 
-
 class DeprecatedCustomTransformsTest(jtu.JaxTestCase):
 
   def test_defvjp_all(self):
@@ -3594,7 +3732,7 @@ class DeprecatedCustomTransformsTest(jtu.JaxTestCase):
       a, b = x[0], x[1]
       return {'hi': 2 * a, 'bye': 2 * b}
 
-    ans, out_tangent = api.jvp(f, ((1, 2),), ((3, 4),))
+    ans, out_tangent = api.jvp(f, ((1., 2.),), ((3., 4.),))
     self.assertEqual(ans, {'hi': 2 * 1, 'bye': 2 * 2})
     self.assertEqual(out_tangent, {'hi': 2 * 3, 'bye': 2 * 4})
 

@@ -289,6 +289,8 @@ def supported_numpy_dtypes():
 def normalize_to_xla_dtypes(val):
   """Normalize dtypes in a value."""
   if hasattr(val, '__array__') or np.isscalar(val):
+    if dtypes.result_type(val) == dtypes.float0:
+      return np.zeros((), dtype=bool)
     return np.asarray(val, dtype=dtypes.canonicalize_dtype(dtypes.result_type(val)))
   elif isinstance(val, (tuple, list)):
     return tuple(normalize_to_xla_dtypes(x) for x in val)
