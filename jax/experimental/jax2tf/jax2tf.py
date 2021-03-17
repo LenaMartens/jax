@@ -34,7 +34,6 @@ from jax._src.lax import lax
 from jax._src.lax import linalg as lax_linalg
 from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lax import fft as lax_fft
-from jax._src.lax import parallel as lax_parallel
 import jax._src.random
 from jax.lib import xla_bridge as xb
 
@@ -131,37 +130,7 @@ def convert(fun: Callable, *,
       JAX arrays, or (nested) standard Python containers (tuple/list/dict)
       thereof.
 
-    in_shapes: an optional sequence of shape specifications,
-      one for each argument of the function to be converted. Default is a
-      list of `None`, in which case the argument shape specifications are taken
-      from the shapes of the actual arguments.
-
-      A non-default `in_shapes` is needed sometimes when the actual arguments
-      have partially-specified shapes. If an argument is a pytree, then the
-      shape specification must be a matching pytree or `None`.
-      See [how optional parameters are matched to arguments](https://jax.readthedocs.io/en/latest/pytrees.html#applying-optional-parameters-to-pytrees).
-      A shape specification should be a string, with comma-separated dimension
-      specifications, and optionally wrapped in parentheses. A dimension
-      specification is either a number, or the placeholder `_`, or a lowercase
-      word denoting a name for a dimension variable, or an arithmetic expression
-      with integer literals, dimension variables, and the operators `+` and `*`.
-      In presence of dimension variables, the conversion is done with a
-      shape abstraction that allows any concrete value for the variable.
-
-      Examples of shape specifications:
-        * `[None, "(batch, 16)"]`: no specification for the first argument (takes
-          the shape from the actual argument); the second argument is a 2D
-          array with the first dimension size set to a variable `batch` and the
-          second dimension 16.
-        * `["(batch, _)", "(batch,)"]`: the leading dimensions of the two arguments
-          must match. The second dimension of the first argument is taken from the
-          actual argument shape.
-        * `[(batch, 2 * batch)]`: a 2D matrix with the second dimension having
-          double the size of the first one.
-
-      See [the README](https://github.com/google/jax/blob/master/jax/experimental/jax2tf/README.md#shape-polymorphic-conversion)
-      for more details.
-
+    in_shapes: Not used. This is kept for backwards compatibility (see #6080).
     with_gradient: if set, will add a tf.custom_gradient to the converted
       function, by converting the ``jax.vjp(fun)``. Only first-order
       differentiation is supported for now. If the converted function is
@@ -213,11 +182,8 @@ def convert(fun: Callable, *,
     if in_shapes is None:
       in_shapes_ = (None,) * len(args)
     else:
-      if not isinstance(in_shapes, Sequence) or len(args) != len(in_shapes):
-        msg = ("in_shapes must be a sequence as long as the argument list "
-               f"({len(args)}). Got in_shapes={in_shapes}.")
-        raise TypeError(msg)
-      in_shapes_ = tuple(in_shapes)
+      raise ValueError("The `in_shapes` parameter is not supported")
+
     # Expand the in_shapes to match the argument pytree
     in_shapes_flat = tuple(api_util.flatten_axes("jax2tf.convert in_shapes",
                                                  in_tree.children()[0], in_shapes_))
@@ -831,18 +797,20 @@ for unexpected in xla.call_translations: # Call primitives are inlined
 
 # Primitives that are not yet implemented must be explicitly declared here.
 tf_not_yet_impl = [
-  lax.reduce_p, lax.rng_uniform_p,
+  "reduce", "rng_uniform",
 
-  lax.igamma_grad_a_p,
-  lax.random_gamma_grad_p,
+  "igamma_grad_a",
+  "random_gamma_grad",
 
   # Not high priority?
-  lax.after_all_p, lax_parallel.all_to_all_p, lax.create_token_p,
-  lax.infeed_p, lax.outfeed_p, lax_parallel.pmax_p,
-  lax_parallel.pmin_p, lax_parallel.ppermute_p, lax_parallel.psum_p,
-  lax_parallel.axis_index_p, lax_parallel.pdot_p, lax_parallel.all_gather_p,
+  "after_all", "all_to_all", "create_token",
+  "infeed", "outfeed", "pmax_p",
+  "pmin", "ppermute", "psum", "pmax", "pgather",
+  "axis_index", "pdot", "all_gather",
+  "rng_bit_generator",
 
-  pxla.xla_pmap_p,
+  "xla_pmap",
+  "call_tf",
 ]
 
 try:
@@ -956,8 +924,9 @@ tf_impl[lax.iota_p] = _iota
 def _div(lhs, rhs):
   if lhs.dtype.is_integer:
     quotient = tf.math.floordiv(lhs, rhs)
-    select = tf.math.logical_and(tf.math.sign(lhs) != tf.math.sign(rhs),
-                                 tf.math.floormod(lhs, rhs) != 0)
+    select = tf.math.logical_and(
+        tf.not_equal(tf.math.sign(lhs), tf.math.sign(rhs)),
+        tf.not_equal(tf.math.floormod(lhs, rhs), 0))
     return tf.where(select, quotient + 1, quotient)
   else:
     return tf.math.truediv(lhs, rhs)
@@ -1105,7 +1074,7 @@ tf_impl[lax.lt_p] = tf.math.less
 
 tf_impl[lax_linalg.cholesky_p] = tf.linalg.cholesky
 
-def _convert_element_type(operand, *, new_dtype):
+def _convert_element_type(operand, *, new_dtype, weak_type=False):
   old_dtype = operand.dtype.as_numpy_dtype
   if (dtypes.issubdtype(old_dtype, np.complexfloating) and
       not dtypes.issubdtype(new_dtype, np.complexfloating)):

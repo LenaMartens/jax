@@ -17,13 +17,21 @@
 
 __all__ = [
   'cuda_prng', 'cusolver', 'rocsolver', 'jaxlib', 'lapack',
-  'pytree', 'tpu_client', 'version', 'xla_client'
+  'pocketfft', 'pytree', 'tpu_client', 'version', 'xla_client'
 ]
 
-import jaxlib
+try:
+  import jaxlib
+except ModuleNotFoundError as err:
+  raise ModuleNotFoundError(
+    'jax requires jaxlib to be installed. See '
+    'https://github.com/google/jax#installation for installation instructions.'
+    ) from err
 
-# Must be kept in sync with the jaxlib version in build/test-requirements.txt
-_minimum_jaxlib_version = (0, 1, 60)
+# Must be kept in sync with the jaxlib versions in
+# - setup.py
+# - build/test-requirements.txt
+_minimum_jaxlib_version = (0, 1, 62)
 try:
   from jaxlib import version as jaxlib_version
 except Exception as err:
@@ -52,10 +60,12 @@ _check_jaxlib_version()
 
 from jaxlib import xla_client
 from jaxlib import lapack
+from jaxlib import pocketfft
 
 xla_extension = xla_client._xla
 pytree = xla_client._xla.pytree
 jax_jit = xla_client._xla.jax_jit
+pmap_lib = xla_client._xla.pmap_lib
 
 try:
   from jaxlib import cusolver  # pytype: disable=import-error
@@ -82,10 +92,3 @@ try:
   from jaxlib import tpu_client  # pytype: disable=import-error
 except:
   tpu_client = None
-
-# TODO(phawkins): Make this import unconditional once the minimum jaxlib version
-# is 0.1.57 or greater.
-try:
-  from jaxlib import pocketfft  # pytype: disable=import-error
-except:
-  pocketfft = None

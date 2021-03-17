@@ -30,11 +30,13 @@ import numpy as np
 
 from . import dtypes
 from .config import FLAGS, config
+from .errors import (ConcretizationTypeError, TracerArrayConversionError,
+                     TracerIntegerConversionError)
 from . import linear_util as lu
 
 from jax._src import source_info_util
 from ._src.util import (safe_zip, safe_map, partial, curry, prod, partialmethod,
-                   tuple_insert, tuple_delete, as_hashable_function,
+                   tuple_insert, tuple_delete, as_hashable_function, unzip2,
                    HashableFunction)
 from ._src.pprint_util import pp, vcat, PrettyPrint
 
@@ -483,18 +485,10 @@ class Tracer:
   __slots__ = ['_trace', '__weakref__', '_line_info']
 
   def __array__(self, *args, **kw):
-    msg = ("The numpy.ndarray conversion method __array__() was called on "
-           f"the JAX Tracer object {self}.\n\n"
-           "This error can occur when a JAX Tracer object is passed to a raw "
-           "numpy function, or a method on a numpy.ndarray object. You might "
-           "want to check that you are using `jnp` together with "
-           "`import jax.numpy as jnp` rather than using `np` via "
-           "`import numpy as np`. If this error arises on a line that involves "
-           "array indexing, like `x[idx]`, it may be that the array being "
-           "indexed `x` is a raw numpy.ndarray while the indices `idx` are a "
-           "JAX Tracer instance; in that case, you can instead write "
-           "`jax.device_put(x)[idx]`.")
-    raise Exception(msg)
+    raise TracerArrayConversionError(self)
+
+  def __index__(self):
+    raise TracerIntegerConversionError(self)
 
   def __init__(self, trace: Trace):
     self._trace = trace
@@ -851,10 +845,16 @@ class AbstractValue:
   def strip_weak_type(self) -> 'AbstractValue':
     return self
 
+  def strip_named_shape(self) -> 'AbstractValue':
+    return self
+
   def join(self, other):
     raise NotImplementedError("must override")
 
   def update(self, **kwargs):
+    raise NotImplementedError("must override")
+
+  def str_short(self):
     raise NotImplementedError("must override")
 
 class Bot(AbstractValue): pass
@@ -885,7 +885,7 @@ def lattice_join(x: Optional[AbstractValue],
   elif isinstance(y, type(x)):
     return x.join(y)
   else:
-    raise TypeError((x, y))
+    raise TypeError(x, y)
 
 # For use in typing annotations to denote either a Tracer or a `valid_jaxtype`.
 Value = Any
@@ -900,14 +900,18 @@ def valid_jaxtype(x):
 
 def check_valid_jaxtype(x):
   if not valid_jaxtype(x):
-    raise TypeError(f"{x} of type {type(x)} is not a valid JAX type")
+    raise TypeError(
+      f"Value {repr(x)} of type {type(x)} is not a valid JAX type")
 
 
 def concrete_aval(x):
   for typ in type(x).mro():
     handler = pytype_aval_mappings.get(typ)
     if handler: return handler(x)
-  raise TypeError(f"{type(x)} is not a valid JAX type")
+  if hasattr(x, '__jax_array__'):
+    return concrete_aval(x.__jax_array__())
+  raise TypeError(f"Value {repr(x)} with type {type(x)} is not a valid JAX "
+                   "type")
 
 
 def get_aval(x):
@@ -936,17 +940,6 @@ unitvar = UnitVar()
 
 pytype_aval_mappings[Unit] = lambda _: abstract_unit
 
-class ConcretizationTypeError(TypeError): pass
-
-def raise_concretization_error(val: Tracer, context=""):
-  msg = ("Abstract tracer value encountered where concrete value is expected.\n\n"
-         + context + "\n\n"
-         + val._origin_msg() + "\n\n"
-         "See https://jax.readthedocs.io/en/latest/faq.html#abstract-tracer-value-encountered-where-concrete-value-is-expected-error for more information.\n\n"
-          f"Encountered tracer value: {val}")
-  raise ConcretizationTypeError(msg)
-
-
 def concretization_function_error(fun, suggest_astype=False):
   fname = getattr(fun, "__name__", fun)
   fname_context = f"The problem arose with the `{fname}` function. "
@@ -955,9 +948,8 @@ def concretization_function_error(fun, suggest_astype=False):
                       f"try using `x.astype({fun.__name__})` "
                       f"or `jnp.array(x, {fun.__name__})` instead.")
   def error(self, arg):
-    raise_concretization_error(arg, fname_context)
+    raise ConcretizationTypeError(arg, fname_context)
   return error
-
 
 def concrete_or_error(force: Any, val: Any, context=""):
   """Like force(val), but gives the context in the error message."""
@@ -967,7 +959,7 @@ def concrete_or_error(force: Any, val: Any, context=""):
     if isinstance(val.aval, ConcreteArray):
       return force(val.aval.val)
     else:
-      raise_concretization_error(val, context)
+      raise ConcretizationTypeError(val, context)
   else:
     return force(val)
 
@@ -1038,21 +1030,24 @@ class UnshapedArray(AbstractValue):
     raise TypeError(msg)
 
 class ShapedArray(UnshapedArray):
-  __slots__ = ['shape']
+  __slots__ = ['shape', 'named_shape']
   array_abstraction_level = 1
 
-  def __init__(self, shape, dtype, weak_type=False):
+  def __init__(self, shape, dtype, weak_type=False, named_shape={}):
     super(ShapedArray, self).__init__(dtype, weak_type=weak_type)
     self.shape = canonicalize_shape(shape)
+    self.named_shape = canonicalize_named_shape(named_shape)
 
-  def update(self, shape=None, dtype=None, weak_type=None):
+  def update(self, shape=None, dtype=None, weak_type=None, named_shape=None):
     if shape is None:
       shape = self.shape
     if dtype is None:
       dtype = self.dtype
     if weak_type is None:
       weak_type = self.weak_type
-    return ShapedArray(shape, dtype, weak_type)
+    if named_shape is None:
+      named_shape = self.named_shape
+    return ShapedArray(shape, dtype, weak_type, named_shape)
 
   ndim = property(lambda self: len(self.shape))
   size = property(lambda self: prod(self.shape))
@@ -1065,21 +1060,25 @@ class ShapedArray(UnshapedArray):
   def __eq__(self, other):
     return (type(self) is type(other)
             and self.dtype == other.dtype and self.shape == other.shape
-            and self.weak_type == other.weak_type)
+            and self.weak_type == other.weak_type
+            and self.named_shape == other.named_shape)
 
   def __hash__(self):
     # can use hash(self.dtype) and rely on the fact that numpy reuses base dtype
     # objects, e.g. `np.zeros(3).dtype is np.zeros(4).dtype`, or we can use
     # the unique character code via hash(self.dtype.char)
-    return hash((self.shape, self.dtype, self.weak_type))
+    return hash((self.shape, self.dtype, self.weak_type,
+                 tuple(self.named_shape.items())))
 
   def at_least_vspace(self):
     return ShapedArray(self.shape, primal_dtype_to_tangent_dtype(self.dtype),
-                       self.weak_type)
+                       self.weak_type, self.named_shape)
 
   def join(self, other):
     if self.shape == other.shape and self.dtype == other.dtype:
-      return self.update(weak_type=self.weak_type and other.weak_type)
+      weak_type = self.weak_type and other.weak_type
+      named_shape = join_named_shapes(self.named_shape, other.named_shape)
+      return self.update(weak_type=weak_type, named_shape=named_shape)
     elif self.dtype == other.dtype:
       return UnshapedArray(self.dtype)
     else:
@@ -1087,7 +1086,14 @@ class ShapedArray(UnshapedArray):
 
   def str_short(self):
     shapestr = ','.join(map(str, self.shape))
-    return '{}[{}]'.format(self.dtype.name, shapestr)
+    if self.named_shape:
+      named_shapestr = ','.join(f'{k}:{v}' for k, v in self.named_shape.items())
+      return f'{self.dtype.name}[{shapestr};{named_shapestr}]'
+    else:
+      return f'{self.dtype.name}[{shapestr}]'
+
+  def strip_named_shape(self):
+    return self.update(named_shape={})
 
   def __len__(self):
     try:
@@ -1131,12 +1137,16 @@ class ConcreteArray(ShapedArray):
   def __hash__(self):
     return id(self.val)
 
-  def join(self, other) -> UnshapedArray:
+  def join(self, other) -> AbstractValue:
     if self == other:
       return self
     elif self.shape == other.shape and self.dtype == other.dtype:
-      return ShapedArray(self.shape, self.dtype,
-                         weak_type=self.weak_type and other.weak_type)
+      weak_type = self.weak_type and other.weak_type
+      named_shape = {name: size
+                     for ns in (self.named_shape, other.named_shape)
+                     for name, size in ns.items()}
+      return ShapedArray(
+          self.shape, self.dtype, weak_type=weak_type, named_shape=named_shape)
     elif self.dtype == other.dtype:
       return UnshapedArray(self.dtype,
                            weak_type=self.weak_type and other.weak_type)
@@ -1183,7 +1193,10 @@ def raise_to_shaped(aval: AbstractValue, weak_type=None):
 raise_to_shaped_mappings : Dict[type, Callable] = {
   AbstractUnit: lambda aval, _: aval,
   AbstractToken: lambda aval, _: aval,
-  ShapedArray: lambda aval, weak_type: ShapedArray(aval.shape, aval.dtype, weak_type=weak_type)
+  Bot: lambda aval, _: aval,
+  UnshapedArray: lambda aval, _: aval,
+  ShapedArray: lambda aval, weak_type: ShapedArray(
+      aval.shape, aval.dtype, weak_type, aval.named_shape)
 }
 
 # Registry for valid dimension types. This is used by masking.Poly.
@@ -1215,6 +1228,99 @@ def canonicalize_shape(shape):
     msg += ("\nIf using `jit`, try using `static_argnums` or applying `jit` to "
             "smaller subfunctions.")
   raise TypeError(msg.format(shape))
+
+def canonicalize_named_shape(named_shape):
+  return dict(sorted(named_shape.items()))
+
+def join_named_shapes(*named_shapes):
+  named_shape_tuples = sorted(set(
+      item for named_shape in named_shapes for item in named_shape.items()))
+  if not named_shape_tuples:
+    return {}
+  names, sizes = unzip2(named_shape_tuples)
+  if len(set(names)) != len(names):
+    seen = set()
+    for name in names:
+      if name in seen:
+        break
+      seen.add(name)
+    raise TypeError(
+        f"Axis name {name} used with inconsistent sizes "
+        f"{[item[1] for item in named_shape_tuples if item[0] == name]}")
+  return dict(zip(names, sizes))
+
+
+# ------------------- Named shapes -------------------
+
+
+class NamedShape:
+  def __init__(self, *args, **kwargs):
+    self.__positional = canonicalize_shape(args)
+    # TODO: Assert that kwargs match axis env?
+    self.__named = dict(kwargs)
+
+  @property
+  def rank(self):
+    return len(self.__positional) + len(self.__named)
+
+  @property
+  def positional_rank(self):
+    return len(self.__positional)
+
+  @property
+  def named_rank(self):
+    return len(self.__named)
+
+  @property
+  def positional(self):
+    return self.__positional
+
+  @property
+  def names(self):
+    return self.__named.keys()
+
+  @property
+  def named_sizes(self):
+    return self._named.values()
+
+  @property
+  def named_items(self):
+    return self.__named.items()
+
+  def __getitem__(self, idx):
+    try:
+      idx = operator.index(idx)
+      return self.__positional[idx]
+    except TypeError:
+      pass
+    return self.__named[idx]
+
+  @property
+  def total(self):
+    total = 1
+    for s in self.__positional: total *= s
+    for s in self.__named.values(): total *= s
+    return total
+
+  def __str__(self):
+    return (f"({', '.join(map(str, self.__positional))}{', ' if self.__named else ''}"
+            f"{', '.join(f'{k}={v}' for k, v in self.__named.items())})")
+
+  def __eq__(self, other):
+    if isinstance(other, NamedShape):
+      return (self.__positional, self.__named) == (other.__positional, other.__named)
+    if isinstance(other, tuple):
+      return not self.__named and self.__positional == other
+    raise TypeError(f"NamedShape doesn't support comparisons with {type(other)}")
+
+  def __hash__(self):
+    return hash((self.__positional, tuple(self.__named.items())))
+
+# TODO: Make canonicalize_shape return named shapes?
+def as_named_shape(shape) -> NamedShape:
+  if isinstance(shape, NamedShape):
+    return shape
+  return NamedShape(*shape)
 
 
 # ------------------- Call -------------------
@@ -1306,6 +1412,38 @@ named_call_p.def_impl(call_impl)
 
 # ------------------- Map -------------------
 
+def mapped_aval(size: int, axis: int, aval: AbstractValue) -> AbstractValue:
+  handler, _ = aval_mapping_handlers.get(type(aval), (None, None))
+  if handler is not None:
+    return handler(size, axis, aval)
+  else:
+    raise TypeError(f"no mapping handler for {aval} of type {type(aval)}")
+
+def unmapped_aval(size: int, axis: int, aval: AbstractValue) -> AbstractValue:
+  _, handler = aval_mapping_handlers.get(type(aval), (None, None))
+  if handler is not None:
+    return handler(size, axis, aval)
+  else:
+    raise TypeError(f"no unmapping handler for {aval} of type {type(aval)}")
+
+def _map_unit(size: int, axis: int, aval: AbstractUnit) -> AbstractUnit:
+  return aval
+
+def _map_shaped_array(size: int, axis: int, aval: ShapedArray) -> ShapedArray:
+  assert aval.shape[axis] == size
+  return ShapedArray(tuple_delete(aval.shape, axis), aval.dtype)
+
+def _unmap_shaped_array(size: int, axis: int, aval: ShapedArray) -> ShapedArray:
+  return ShapedArray(tuple_insert(aval.shape, axis, size), aval.dtype)
+
+AvalMapHandlerPair = Tuple[Callable, Callable]
+aval_mapping_handlers: Dict[Type, AvalMapHandlerPair] = {
+    AbstractUnit: (_map_unit, _map_unit),
+    ShapedArray:   (_map_shaped_array, _unmap_shaped_array),
+    ConcreteArray: (_map_shaped_array, _unmap_shaped_array),
+}
+
+
 class MapPrimitive(Primitive):
   multiple_results = True
   map_primitive = True
@@ -1346,6 +1484,7 @@ def extend_axis_env_nd(axes: Iterable[Tuple[AxisName, int]]):
 # object. We don't want to use the function object itself because that might
 # persist references to the function object.
 # TODO(mattjj): revisit this unique axis name strategy
+@total_ordering
 class _TempAxisName:
 
   def __init__(self, obj):
@@ -1359,6 +1498,9 @@ class _TempAxisName:
 
   def __eq__(self, other):
     return type(other) is _TempAxisName and self.id == other.id
+
+  def __lt__(self, other):
+    return type(other) is _TempAxisName and self.id < other.id
 
 
 def axis_frame(axis_name):
@@ -1387,43 +1529,65 @@ def used_axis_names(primitive: Primitive, params: ParamDict) -> Set[AxisName]:
 def subst_axis_names(primitive: Primitive, params: ParamDict, subst: AxisSubst) -> ParamDict:
   if primitive in axis_substitution_rules:
     return axis_substitution_rules[primitive](params, subst)
-  return params
+  # Default implementation: substitute names in all jaxpr parameters
+  if isinstance(primitive, MapPrimitive):
+    def shadowed_subst(name):
+      return (name,) if name == params['axis_name'] else subst(name)
+  else:
+    shadowed_subst = subst
+  jaxpr_params = [(n, v) for n, v in params.items() if isinstance(v, (Jaxpr, ClosedJaxpr))]
+  if not jaxpr_params:
+    return params
+  new_params = dict(params)
+  for name, jaxpr in jaxpr_params:
+    new_params[name] = subst_axis_names_jaxpr(jaxpr, shadowed_subst)
+  return new_params
+
+def subst_axis_names_jaxpr(jaxpr: Union[Jaxpr, ClosedJaxpr], subst: AxisSubst):
+  consts = None
+  if isinstance(jaxpr, ClosedJaxpr):
+    consts = jaxpr.consts
+    jaxpr = jaxpr.jaxpr
+  eqns = [eqn._replace(params=subst_axis_names(eqn.primitive, eqn.params, subst))
+          for eqn in jaxpr.eqns]
+  new_jaxpr = Jaxpr(jaxpr.constvars, jaxpr.invars, jaxpr.outvars, eqns)
+  if consts is not None:
+    return ClosedJaxpr(new_jaxpr, consts)
+  return new_jaxpr
 
 axis_substitution_rules: Dict[Primitive, Callable[[ParamDict, AxisSubst], ParamDict]] = {}
 
 # ------------------- Jaxpr checking -------------------
 
-def mapped_aval(size: int, axis: int, aval: AbstractValue) -> AbstractValue:
-  if aval is abstract_unit:
-    return aval
-  elif isinstance(aval, ShapedArray):
-    # might be raising abstraction level from Concrete here
-    assert aval.shape[axis] == size
-    return ShapedArray(tuple_delete(aval.shape, axis), aval.dtype)
-  else:
-    raise TypeError(f"Mapped operand {aval}")
-
-def unmapped_aval(size: int, axis: int, aval: AbstractValue) -> AbstractValue:
-  if aval is abstract_unit:
-    return aval
-  elif isinstance(aval, ShapedArray):
-    return ShapedArray(tuple_insert(aval.shape, axis, size), aval.dtype)
-  else:
-    raise TypeError(f"Mapped output {aval}")
-
 def typecheck(aval: AbstractValue, x) -> bool:
   return typecompat(aval, get_aval(x))
 
 def typecompat(aval_ref: AbstractValue, aval: AbstractValue) -> bool:
-  """Determine whether `aval` conforms to `aval_ref`"""
-  aval_ref = raise_to_shaped(aval_ref).strip_weak_type()
+  """Determine whether `aval` conforms to `aval_ref`.
+
+  Ignores weak_type and named_shape, other than to check that an axis name isn't
+  used with different sizes.
+  """
   try:
-    return aval_ref == lattice_join(aval_ref, aval).strip_weak_type()
+    return typematch(aval_ref, lattice_join(aval_ref, aval))
   except TypeError:
     return False
 
-def typematch(aval1: UnshapedArray, aval2: UnshapedArray) -> bool:
-  return raise_to_shaped(aval1, weak_type=False) == raise_to_shaped(aval2, weak_type=False)
+def typematch(aval1: AbstractValue, aval2: AbstractValue) -> bool:
+  """Determine whether `aval1` and `aval2` are equivalent.
+
+  Ignores weak_type and named_shape, other than to check that an axis name isn't
+  used with different sizes.
+  """
+  if aval1 == aval2: return True
+  # unequal avals may still represent the same type, because type is represented
+  # by avals at the shaped level, and because weak type tags and (for now) named
+  # shape components aren't considered part of the type
+  if isinstance(aval1, ShapedArray) and isinstance(aval2, ShapedArray):
+    # a bonus check for whether any named axes have inconsistent sizes
+    join_named_shapes(aval1.named_shape, aval2.named_shape)
+  return (raise_to_shaped(aval1, weak_type=False).strip_named_shape() ==
+          raise_to_shaped(aval2, weak_type=False).strip_named_shape())
 
 class JaxprTypeError(TypeError): pass
 
@@ -1558,7 +1722,8 @@ def check_map(prim, in_avals, params):
   mapped_avals = [mapped_aval(axis_size, in_axis, aval)
                   if in_axis is not None else aval
                   for aval, in_axis in zip(in_avals, in_axes)]
-  _check_jaxpr(call_jaxpr, mapped_avals)
+  with extend_axis_env(params['axis_name'], axis_size, None):
+    _check_jaxpr(call_jaxpr, mapped_avals)
 
   mapped_out_avals = [v.aval for v in call_jaxpr.outvars]
   out_avals = [unmapped_aval(axis_size, out_axis, aval) if out_axis is not None else aval

@@ -65,9 +65,7 @@ def tree_flatten(tree, is_leaf: Optional[Callable[[Any], bool]] = None):
     A pair where the first element is a list of leaf values and the second
     element is a treedef representing the structure of the flattened tree.
   """
-  # We skip the second argument in support of old jaxlibs
-  # TODO: Remove once 0.1.58 becomes the minimum supported jaxlib version
-  return pytree.flatten(tree) if is_leaf is None else pytree.flatten(tree, is_leaf)
+  return pytree.flatten(tree, is_leaf)
 
 
 def tree_unflatten(treedef, leaves):
@@ -237,7 +235,7 @@ def tree_transpose(outer_treedef, inner_treedef, pytree_to_transpose):
 # TODO(mattjj): remove the Python-side registry when the C++-side registry is
 # sufficiently queryable that we can express _replace_nones. That may mean once
 # we have a flatten_one function.
-_RegistryEntry = collections.namedtuple("RegistryEntry", ["to_iter", "from_iter"])
+_RegistryEntry = collections.namedtuple("_RegistryEntry", ["to_iter", "from_iter"])
 _registry = {
     tuple: _RegistryEntry(lambda xs: (xs, None), lambda _, xs: tuple(xs)),
     list: _RegistryEntry(lambda xs: (xs, None), lambda _, xs: list(xs)),
@@ -306,6 +304,45 @@ class Partial(functools.partial):
 
   (You need to explicitly opt-in to this behavior because we didn't want to give
   functools.partial different semantics than normal function closures.)
+
+  For example, here is a basic usage of ``Partial`` in a manner similar to
+  ``functools.partial``:
+
+  >>> import jax.numpy as jnp
+  >>> add_one = Partial(jnp.add, 1)
+  >>> add_one(2)
+  DeviceArray(3, dtype=int32)
+
+  Pytree compatibility means that the resulting partial function can be passed
+  as an argument within transformed JAX functions, which is not possible with a
+  standard ``functools.partial`` function:
+
+  >>> from jax import jit
+  >>> @jit
+  ... def call_func(f, *args):
+  ...   return f(*args)
+  ...
+  >>> call_func(add_one, 2)
+  DeviceArray(3, dtype=int32)
+
+  Passing zero arguments to ``Partial`` effectively wraps the original function,
+  making it a valid argument in JAX transformed functions:
+
+  >>> call_func(Partial(jnp.add), 1, 2)
+  DeviceArray(3, dtype=int32)
+
+  Had we passed ``jnp.add`` to ``call_func`` directly, it would have resulted in a
+  ``TypeError``.
+
+  Note that if the result of ``Partial`` is used in the context where the
+  value is traced, it results in all bound arguments being traced when passed
+  to the partially-evaluated function:
+
+  >>> print_zero = Partial(print, 0)
+  >>> print_zero()
+  0
+  >>> call_func(print_zero)
+  Traced<ShapedArray(int32[], weak_type=True)>with<DynamicJaxprTrace(level=0/1)>
   """
 
 register_pytree_node(

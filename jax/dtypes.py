@@ -28,7 +28,8 @@ from typing import Dict
 import numpy as np
 
 from ._src import util
-from .config import flags
+from .config import flags, config
+from . import lib
 from .lib import xla_client
 
 from ._src import traceback_util
@@ -38,16 +39,18 @@ FLAGS = flags.FLAGS
 flags.DEFINE_bool('jax_enable_x64',
                   strtobool(os.getenv('JAX_ENABLE_X64', 'False')),
                   'Enable 64-bit types to be used.')
+lib.jax_jit.set_enable_x64_cpp_flag(
+    strtobool(os.getenv('JAX_ENABLE_X64', 'False')))
 
 # bfloat16 support
-bfloat16 = xla_client.bfloat16
-_bfloat16_dtype = np.dtype(bfloat16)
+bfloat16: type = xla_client.bfloat16
+_bfloat16_dtype: np.dtype = np.dtype(bfloat16)
 
 # Default types.
 
 bool_ = np.bool_
-int_ = np.int64
-float_ = np.float64
+int_: np.dtype = np.int64  # type: ignore
+float_: np.dtype = np.float64  # type: ignore
 complex_ = np.complex128
 
 # TODO(phawkins): change the above defaults to:
@@ -67,7 +70,7 @@ _dtype_to_32bit_dtype = {
 
 @util.memoize
 def canonicalize_dtype(dtype):
-  """Convert from a dtype to a canonical dtype based on FLAGS.jax_enable_x64."""
+  """Convert from a dtype to a canonical dtype based on config.x64_enabled."""
   if isinstance(dtype, str) and dtype == "bfloat16":
     dtype = bfloat16
   try:
@@ -75,19 +78,18 @@ def canonicalize_dtype(dtype):
   except TypeError as e:
     raise TypeError(f'dtype {dtype!r} not understood') from e
 
-  if FLAGS.jax_enable_x64:
+  if config.x64_enabled:
     return dtype
   else:
     return _dtype_to_32bit_dtype.get(dtype, dtype)
 
 
 # Default dtypes corresponding to Python scalars.
-python_scalar_dtypes = {
+python_scalar_dtypes : dict = {
   bool: np.dtype(bool_),
   int: np.dtype(int_),
   float: np.dtype(float_),
   complex: np.dtype(complex_),
-  float0: float0
 }
 
 def scalar_type_of(x):
@@ -218,19 +220,15 @@ _jax_types = [
   np.dtype('float64'),
   np.dtype('complex64'),
   np.dtype('complex128'),
-] + _weak_types
+] + _weak_types  # type: ignore[operator]
 
-def _jax_type(value):
-  """Return the jax type for a value or type."""
-  # Note: `x in _weak_types` can return false positives due to dtype comparator overloading.
-  if any(value is typ for typ in _weak_types):
-    return value
-  dtype_ = dtype(value)
-  if is_weakly_typed(value):
-    pytype = type(dtype_.type(0).item())
-    if pytype in _weak_types:
-      return pytype
-  return dtype_
+def _jax_type(dtype, weak_type):
+  """Return the jax type for a dtype and weak type."""
+  return type(dtype.type(0).item()) if (weak_type and dtype != bool) else dtype
+
+def _dtype_and_weaktype(value):
+  """Return a (dtype, weak_type) tuple for the given input."""
+  return dtype(value), any(value is typ for typ in _weak_types) or is_weakly_typed(value)
 
 def _type_promotion_lattice():
   """
@@ -262,6 +260,14 @@ _lattice_upper_bounds = _make_lattice_upper_bounds()
 
 @functools.lru_cache(512)  # don't use util.memoize because there is no X64 dependence.
 def _least_upper_bound(*nodes):
+  """Compute the least upper bound of a set of nodes.
+
+  Args:
+    nodes: sequence of entries from _jax_types
+  Returns:
+    the _jax_type representing the least upper bound of the input nodes
+      on the promotion lattice.
+  """
   # This function computes the least upper bound of a set of nodes N within a partially
   # ordered set defined by the lattice generated above.
   # Given a partially ordered set S, let the set of upper bounds of n ∈ S be
@@ -321,10 +327,23 @@ def dtype(x):
     return python_scalar_dtypes[type(x)]
   return np.result_type(x)
 
+def _lattice_result_type(*args):
+  dtypes, weak_types = zip(*(_dtype_and_weaktype(arg) for arg in args))
+  if len(dtypes) == 1:
+    return dtypes[0], weak_types[0]
+
+  # If all inputs are weakly typed, we compute the bound of the strongly-typed
+  # counterparts and apply the weak type at the end. This avoids returning the
+  # incorrect result with non-canonical weak types (e.g. weak int16).
+  if all(weak_types):
+    result_type = _least_upper_bound(*{_jax_type(dtype, False) for dtype in dtypes})
+    return dtype(result_type), True
+  else:
+    result_type = _least_upper_bound(*{_jax_type(d, w) for d, w in zip(dtypes, weak_types)})
+    return dtype(result_type), any(result_type is t for t in _weak_types)
+
 def result_type(*args):
-  """Convenience function to apply Numpy argument dtype promotion."""
-   # TODO(jakevdp): propagate weak_type to the result.
-  if len(args) < 2:
-    return canonicalize_dtype(dtype(args[0]))
-  # TODO(jakevdp): propagate weak_type to the result when necessary.
-  return canonicalize_dtype(_least_upper_bound(*{_jax_type(arg) for arg in args}))
+  """Convenience function to apply JAX argument dtype promotion."""
+  if len(args) == 0:
+    raise ValueError("at least one array or dtype is required")
+  return canonicalize_dtype(_lattice_result_type(*args)[0])

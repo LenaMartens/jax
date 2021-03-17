@@ -27,7 +27,6 @@ from ..config import flags, bool_env, config
 from .. import core
 from .. import ad_util
 from .. import dtypes
-from .. import lazy
 from .. import linear_util as lu
 from jax._src import source_info_util
 from ..abstract_arrays import (make_shaped_array, array_types)
@@ -36,6 +35,7 @@ from ..core import (ConcreteArray, ShapedArray, AbstractToken,
 from jax._src.pprint_util import pp
 from .._src.util import (partial, partialmethod, cache, prod, unzip2,
                     extend_name_stack, wrap_name, safe_zip, safe_map)
+from .. import lib
 from ..lib import xla_bridge as xb
 from ..lib import xla_client as xc
 from . import partial_eval as pe
@@ -114,8 +114,7 @@ def aval_to_result_handler(device: Optional[Device], aval: core.AbstractValue) -
 def array_result_handler(device: Optional[Device], aval: core.ShapedArray):
   if aval.dtype is dtypes.float0:
     return lambda _: np.zeros(aval.shape, dtypes.float0)
-  return partial(make_device_array, raise_to_shaped(aval), device,
-                 lazy.array(aval.shape))
+  return partial(make_device_array, raise_to_shaped(aval), device)
 
 
 xla_result_handlers: Dict[Type[core.AbstractValue], Callable[..., Callable]] = {
@@ -154,6 +153,8 @@ def canonicalize_dtype(x):
   for typ in typ.mro():
     handler = canonicalize_dtype_handlers.get(typ)
     if handler: return handler(x)
+  if hasattr(x, '__jax_array__'):
+    return canonicalize_dtype(x.__jax_array__())
   raise TypeError(f"No canonicalize_dtype handler for type: {type(x)}")
 
 def _canonicalize_ndarray_dtype(x):
@@ -176,6 +177,8 @@ def abstractify(x) -> core.AbstractValue:
   for typ in typ.mro():
     aval_fn = pytype_aval_mappings.get(typ)
     if aval_fn: return aval_fn(x)
+  if hasattr(x, '__jax_array__'):
+    return abstractify(x.__jax_array__())
   raise TypeError(f"Argument '{x}' of type '{type(x)}' is not a valid JAX type")
 
 def _make_abstract_python_scalar(typ, _):
@@ -355,21 +358,26 @@ def _execute_compiled_primitive(prim, compiled, result_handler, *args):
   device, = compiled.local_devices()
   input_bufs = list(it.chain.from_iterable(device_put(x, device) for x in args if x is not token))
   out_bufs = compiled.execute(input_bufs)
-  check_special(prim, out_bufs)
+  check_special(prim.name, out_bufs)
   return result_handler(*out_bufs)
 
 def _execute_replicated_primitive(prim, compiled, result_handler, *args):
   input_bufs = [
       list(it.chain.from_iterable(device_put(x, device) for x in args if x is not token))
       for device in compiled.local_devices()]
-  out_bufs = compiled.execute_on_local_devices(input_bufs)[0]
+  out_bufs = [
+      buf[0] for buf in compiled.execute_sharded_on_local_devices(
+          list(zip(*input_bufs)))
+  ]
   return result_handler(*out_bufs)
 
+def needs_check_special():
+  return FLAGS.jax_debug_infs or FLAGS.jax_debug_nans
 
-def check_special(prim, bufs):
-  if FLAGS.jax_debug_infs or FLAGS.jax_debug_nans:
+def check_special(name, bufs):
+  if needs_check_special():
     for buf in bufs:
-      _check_special(prim.name, buf.xla_shape(), buf)
+      _check_special(name, buf.xla_shape(), buf)
 
 def _check_special(name, xla_shape, buf):
   assert not xla_shape.is_tuple()
@@ -674,13 +682,14 @@ def _xla_callable(fun: lu.WrappedFun, device, backend, name, donated_invars, *ar
 
   # Computations that only produce constants and/or only rearrange their inputs,
   # which are often produced from partial evaluation, don't need compilation,
-  # and don't need to force their (potentially lazy) arguments.
+  # and don't need to evaluate their arguments.
   if not jaxpr.eqns:
     return partial(_execute_trivial, jaxpr, device, consts, out_avals, result_handlers)
 
   if not _on_exit:
     log_priority = logging.WARNING if FLAGS.jax_log_compiles else logging.DEBUG
-    logging.log(log_priority, "Compiling %s for args %s.", fun.__name__, abstract_args)
+    logging.log(log_priority, "Compiling %s (%s) for args %s.",
+                fun.__name__, id(fun), abstract_args)
 
   if nreps > 1:
     warn(f"The jitted function {fun.__name__} includes a pmap. Using "
@@ -738,7 +747,7 @@ def set_up_aliases(c, xla_args, out_tuple, donated_args, tuple_args):
   for arg_index, arg in enumerate(xla_args):
     if donated_args[arg_index]:
       for param_index, element in flatten_shape(c.GetShape(arg)):
-        key = (element.dimensions(), element.numpy_dtype())
+        key = (element.dimensions(), element.xla_element_type())
         if tuple_args:
           param_number = 0
           param_index = (arg_index,) + tuple(param_index)
@@ -750,7 +759,7 @@ def set_up_aliases(c, xla_args, out_tuple, donated_args, tuple_args):
   # Consume donations for outputs.
   out_donated_args = list(donated_args)
   for output_index, element in flatten_shape(c.GetShape(out_tuple)):
-    key = (element.dimensions(), element.numpy_dtype())
+    key = (element.dimensions(), element.xla_element_type())
     if donations.get(key, ()):
       param_number, param_index, arg_index = donations[key].popleft()
       out_donated_args[arg_index] = False
@@ -839,15 +848,18 @@ def _execute_compiled(compiled: XlaExecutable, avals, handlers, *args):
   device, = compiled.local_devices()
   input_bufs = list(it.chain.from_iterable(device_put(x, device) for x in args if x is not token))
   out_bufs = compiled.execute(input_bufs)
-  check_special(xla_call_p, out_bufs)
+  check_special(xla_call_p.name, out_bufs)
   return [handler(*bs) for handler, bs in zip(handlers, _partition_outputs(avals, out_bufs))]
 
 def _execute_replicated(compiled: XlaExecutable, avals, handlers, *args):
   input_bufs = [
       list(it.chain.from_iterable(device_put(x, device) for x in args if x is not token))
       for device in compiled.local_devices()]
-  out_bufs = compiled.execute_on_local_devices(input_bufs)[0]
-  check_special(xla_call_p, out_bufs)
+  out_bufs = [
+      buf[0] for buf in compiled.execute_sharded_on_local_devices(
+          list(zip(*input_bufs)))
+  ]
+  check_special(xla_call_p.name, out_bufs)
   return [handler(*bs) for handler, bs in zip(handlers, _partition_outputs(avals, out_bufs))]
 
 def _execute_trivial(jaxpr, device: Optional[Device], consts, avals, handlers, *args):
@@ -859,7 +871,7 @@ def _execute_trivial(jaxpr, device: Optional[Device], consts, avals, handlers, *
   return [_copy_device_array_to_device(x, device) if type_is_device_array(x)
           else h(*device_put(x, device)) for h, x in zip(handlers, outs)]
 
-xla_call_p = core.CallPrimitive('xla_call')
+xla_call_p: core.CallPrimitive = core.CallPrimitive('xla_call')
 xla_call = xla_call_p.bind
 xla_call_p.def_impl(_xla_call_impl)
 
@@ -1013,37 +1025,36 @@ _forward_to_value = partial(_forward_method, "_value")
 
 # The following is used for the type _CppDeviceArray or _DeviceArray.
 DeviceArrayProtocol = Any
-if hasattr(xc, "DeviceArrayBase"):
-  DeviceArray = xc.DeviceArrayBase
-else:
-  # prior to jaxlib version 0.1.58.
-  class DeviceArray:  # type: ignore
-    pass
+DeviceArray = xc.DeviceArrayBase
 
 _CppDeviceArray: DeviceArrayProtocol = xc.Buffer
 
-_EXPERIMENTAL_CPP_DEVICE_ARRAY = False
-
+_EXPERIMENTAL_CPP_DEVICE_ARRAY = lib._xla_extension_version >= 7
+_HAVE_WEAK_TYPE_ATTR = lib._xla_extension_version >= 8
 
 def make_device_array(
     aval: core.ShapedArray,
     device: Optional[Device],
-    lazy_expr: Optional[lazy.LazyExpr],
-    device_buffer: Union[PyLocalBuffer, "DeviceConstant"],
+    device_buffer: PyLocalBuffer,
 ) -> Union[PyLocalBuffer, "_DeviceArray"]:
   """Returns a DeviceArray implementation based on arguments.
 
   This is to be used only within JAX. It will return either a PythonDeviceArray
   or a C++ equivalent implementation.
   """
-  if (_EXPERIMENTAL_CPP_DEVICE_ARRAY and lazy.is_trivial(lazy_expr) and
-      not isinstance(device_buffer, DeviceConstant)):
-    assert isinstance(device_buffer, _CppDeviceArray)
-    device_buffer._device = device    # pylint: disable=protected-access
+  if (_EXPERIMENTAL_CPP_DEVICE_ARRAY and
+      isinstance(device_buffer, _CppDeviceArray)):
+
+    if device_buffer.aval == aval and device_buffer._device == device:
+      return device_buffer
+    device_buffer = device_buffer.clone()
+    device_buffer._device = device
     device_buffer.aval = aval
+    if _HAVE_WEAK_TYPE_ATTR:
+      device_buffer.weak_type = aval.weak_type
     return device_buffer
 
-  return _DeviceArray(aval, device, lazy_expr, device_buffer)
+  return _DeviceArray(aval, device, device_buffer)
 
 
 def type_is_device_array(x):
@@ -1060,7 +1071,7 @@ class _DeviceArray(DeviceArray):  # type: ignore
   # We don't subclass ndarray because that would open up a host of issues,
   # but lax_numpy.py overrides isinstance behavior and attaches ndarray methods.
   __slots__ = [
-      "aval", "device_buffer", "_npy_value", "_device", "_lazy_expr"
+      "aval", "device_buffer", "_npy_value", "_device"
   ]
   __array_priority__ = 100
 
@@ -1069,7 +1080,6 @@ class _DeviceArray(DeviceArray):  # type: ignore
   _HAS_DYNAMIC_ATTRIBUTES = True
 
   def __init__(self, aval: core.ShapedArray, device: Optional[Device],
-               lazy_expr: Optional[lazy.LazyExpr],
                device_buffer: PyLocalBuffer):
     """Initializer.
 
@@ -1077,15 +1087,12 @@ class _DeviceArray(DeviceArray):  # type: ignore
       aval: The abstract value associated to this array (shape+dtype+weak_type).
       device:  The optional sticky device. See
         https://jax.readthedocs.io/en/latest/faq.html#controlling-data-and-computation-placement-on-devices
-      lazy_expr: An optional `LayExpr`. `None` is equivalent to a trivial
-        `LazyExpr`.
       device_buffer: The underlying buffer owning the on-device data.
     """
     DeviceArray.__init__(self)
     self.aval = aval
     self.device_buffer = device_buffer
     self._device = device
-    self._lazy_expr = lazy_expr
 
     self._npy_value = None
     if not core.skip_checks:
@@ -1115,10 +1122,7 @@ class _DeviceArray(DeviceArray):  # type: ignore
   def _value(self):
     self._check_if_deleted()
     if self._npy_value is None:
-      if is_device_constant(self):
-        self._npy_value = lazy.eval_lexpr(self._lazy_expr, None)
-      else:
-        self._npy_value = _force(self).device_buffer.to_py()
+      self._npy_value = self.device_buffer.to_py()
       self._npy_value.flags.writeable = False
     return self._npy_value
 
@@ -1138,10 +1142,15 @@ class _DeviceArray(DeviceArray):  # type: ignore
   def ndim(self):
     return len(self.aval.shape)
 
+  # TODO(phawkins): remove when jaxlib 0.1.63 is the minimum.
+  @property
+  def _lazy_expr(self):
+    return None
+
   def copy_to_host_async(self):
     """Requests a copy of the buffer to the host."""
     self._check_if_deleted()
-    if self._npy_value is None and not is_device_constant(self):
+    if self._npy_value is None:
       self.device_buffer.copy_to_host_async()  # pytype: disable=attribute-error
 
   def delete(self):
@@ -1161,12 +1170,12 @@ class _DeviceArray(DeviceArray):  # type: ignore
 
   @property
   def __cuda_array_interface__(self):
-    return _force(self).device_buffer.__cuda_array_interface__
+    return self.device_buffer.__cuda_array_interface__
 
 
 # Adding methods dynamically to both _DeviceArray and _CppDeviceArray
 # pylint: disable=protected-access
-for device_array in [_DeviceArray, _CppDeviceArray]:
+for device_array in [DeviceArray]:
 
 
   def copy(self):
@@ -1277,15 +1286,6 @@ for device_array in [_DeviceArray, _CppDeviceArray]:
 class DeletedBuffer(object): pass
 deleted_buffer = DeletedBuffer()
 
-class DeviceConstant(object):
-  __slots__ = ["_device"]
-  def __init__(self, device=None): self._device = device
-  def device(self): return self._device
-  def to_py(self): return None
-
-def is_device_constant(x):
-  return type_is_device_array(x) and type(x.device_buffer) is DeviceConstant
-
 for device_array in [_CppDeviceArray, _DeviceArray]:
   core.literalable_types.add(device_array)
   core.pytype_aval_mappings[device_array] = ConcreteArray
@@ -1293,17 +1293,13 @@ for device_array in [_CppDeviceArray, _DeviceArray]:
   canonicalize_dtype_handlers[device_array] = identity
 
 def _device_array_constant_handler(c, val, canonicalize_types=True):
-  if is_device_constant(val):
-    return lazy.stage_lexpr(c, val._lazy_expr, None)
-  else:
-    base_val = xb.constant(c, val.device_buffer.to_py())
-    return lazy.stage_lexpr(c, val._lazy_expr, base_val)
+  return xb.constant(c, val.device_buffer.to_py())
 xb.register_constant_handler(_DeviceArray, _device_array_constant_handler)
 xb.register_constant_handler(_CppDeviceArray, _device_array_constant_handler)
 
 def _device_put_device_array(x: Union[DeviceArrayProtocol, _DeviceArray], device: Optional[Device]):
   x = _copy_device_array_to_device(x, device)
-  return (_force(x).device_buffer,)
+  return (x.device_buffer,)
 device_put_handlers[_CppDeviceArray] = _device_put_device_array
 device_put_handlers[_DeviceArray] = _device_put_device_array
 
@@ -1311,10 +1307,6 @@ def _copy_device_array_to_device(x: Union[DeviceArrayProtocol, _DeviceArray], de
   if device is None:
     # no copying to be done because there's no target specified
     return x
-  elif is_device_constant(x):
-    # create a new DeviceArray with the same lazy expr, no copying
-    return make_device_array(x.aval, device, x._lazy_expr,
-                               DeviceConstant(device))
   elif xb.get_device_backend(device).platform == x.device_buffer.platform():
     # source and target platforms are the same
     if x.device_buffer.device() == device:
@@ -1330,52 +1322,7 @@ def _copy_device_array_to_device(x: Union[DeviceArrayProtocol, _DeviceArray], de
     # buffers from different XLA backends are passed through the host.
     backend = xb.get_device_backend(device)
     moved_buf = backend.buffer_from_pyval(x.device_buffer.to_py(), device)
-  return _DeviceArray(x.aval, device, x._lazy_expr, moved_buf)
-
-def _force(x: DeviceArrayProtocol) -> DeviceArrayProtocol:
-  if lazy.is_trivial(x._lazy_expr):
-    return x
-  else:
-    # force x on the device where it lives, but preserve stickiness on result
-    if x._device:
-      device = x._device
-    else:
-      device = x.device_buffer.device()
-    force_fun = _lazy_force_computation(x.aval, device, x._lazy_expr)
-    result = force_fun(x)
-    return make_device_array(x.aval, x._device, lazy.array(x.aval.shape), result)
-
-@cache()
-def _lazy_force_computation(aval: core.ShapedArray,
-                            device: Device, lexpr: lazy.LazyExpr
-                            ) -> Callable[[_DeviceArray], PyLocalBuffer]:
-  c = xb.make_computation_builder("lazy_force")
-  if lazy.is_constant(lexpr):
-    param = None
-  else:
-    idxs = [(src, dst) for dst, src in enumerate(lexpr.dims) if src is not None]
-    param_shape = [None] * len(idxs)
-    for src, dst in idxs:
-      param_shape[src] = aval.shape[dst]
-    param = xb.parameter(c, 0, xc.Shape.array_shape(aval.dtype, param_shape))
-  xla_out = lazy.stage_lexpr(c, lexpr, param)
-  built_c = c.build(xla_out)
-
-  device = _device_from_arg_devices([device])
-  options = xb.get_compile_options(
-      num_replicas=1,
-      num_partitions=1,
-      device_assignment=device and (device.id,))
-  compiled = backend_compile(xb.get_device_backend(device), built_c, options)
-
-  force_fun: Callable[[_DeviceArray], PyLocalBuffer]
-  if lazy.is_constant(lexpr):
-    def force_fun(_):
-      return compiled.execute([])[0]
-  else:
-    def force_fun(x):
-      return compiled.execute([x.device_buffer])[0]
-  return force_fun
+  return make_device_array(x.aval, device, moved_buf)
 
 
 def _device_put_impl(x, device: Optional[Device] = None):
@@ -1397,15 +1344,23 @@ ad.deflinear2(device_put_p, lambda cotangent, _, **kwargs: [cotangent])
 masking.defvectorized(device_put_p)
 
 
-def _remat_translation_rule(c, axis_env, in_nodes,
-                            name_stack, backend, name, call_jaxpr,
-                            device=None, concrete=None):
+def _zeros(c, xla_shape):
+  if xla_shape.is_array():
+    shape, dtype = xla_shape.dimensions(), xla_shape.numpy_dtype()
+    zero = xb.constant(c, np.array(0, dtype=dtype))
+    return xops.Broadcast(zero, shape)
+  else:
+    # It is a token
+    return xops.CreateToken(c)
+
+
+def _remat_using_cond(
+    c, axis_env, in_nodes, name_stack, backend, name, call_jaxpr):
   """Lower remat to a Conditional which always returns true. This:
     1. Circumvents common subexpression elimination.
     2. In common case of `jax.grad(jax.remat(f))`, ensures the remat blocks
        occur after the primal blocks, because cotangent is an input to the
        Conditional."""
-  del device, concrete  # Unused.
   # Fake condition which always selects True branch.
   rng = xops.RngUniform(xb.constant(c, np.array(0, dtype=np.float32)),
                         xb.constant(c, np.array(1, dtype=np.float32)),
@@ -1415,7 +1370,7 @@ def _remat_translation_rule(c, axis_env, in_nodes,
   true_op = xops.Tuple(c, in_nodes)
   remat_subc = xb.make_computation_builder("remat_call_subcomputation")
   input_op = xb.parameter(remat_subc, 0, c.get_shape(true_op), replicated=[])
-  args = [xops.GetTupleElement(input_op, i) for i in range(len(in_nodes))]
+  args = xla_destructure(remat_subc, input_op)
   out_nodes = jaxpr_subcomp(remat_subc, call_jaxpr, backend, axis_env, (),
                             extend_name_stack(name_stack, wrap_name(name, 'remat')),
                             *args)
@@ -1425,19 +1380,61 @@ def _remat_translation_rule(c, axis_env, in_nodes,
   false_op = true_op
   dummy_subc = xb.make_computation_builder("remat_call_dummy_subcomputation")
   xb.parameter(dummy_subc, 0, c.get_shape(false_op), replicated=[])
-
-  def zeros(xla_shape):
-    if xla_shape.is_array():
-      shape, dtype = xla_shape.dimensions(), xla_shape.numpy_dtype()
-      zero = xb.constant(dummy_subc, np.array(0, dtype=dtype))
-      return xops.Broadcast(zero, shape)
-    else:
-      # It is a token
-      return xops.CreateToken(dummy_subc)
-  out_nodes = [zeros(s) for s in out_node_shapes]
+  out_nodes = [_zeros(dummy_subc, s) for s in out_node_shapes]
   dummy_subc = dummy_subc.build(xops.Tuple(dummy_subc, out_nodes))
 
   return xops.Conditional(pred, true_op, remat_subc, false_op, dummy_subc)
+
+
+def _remat_using_while(
+    c, axis_env, in_nodes, name_stack, backend, name, call_jaxpr):
+  """Lower remat to a single iteration while loop."""
+  # Dummy subc for getting subcomp shapes.
+  dummy_inputs = xops.Tuple(c, in_nodes)
+  dummy_subc = xb.make_computation_builder("remat_dummy_subcomputation")
+  dummy_input_op = xb.parameter(dummy_subc, 0, c.get_shape(dummy_inputs), replicated=[])
+  dummy_args = xla_destructure(dummy_subc, dummy_input_op)
+  dummy_subcomp_outs = jaxpr_subcomp(
+      dummy_subc, call_jaxpr, backend, axis_env, (),
+      extend_name_stack(name_stack, wrap_name(name, "remat")), *dummy_args)
+  out_node_shapes = [dummy_subc.get_shape(o) for o in dummy_subcomp_outs]
+
+  i_init = xb.constant(c, np.array(0, dtype=np.int32))
+  zeros_like_outs = [_zeros(c, s) for s in out_node_shapes]
+  inputs = xops.Tuple(c, [i_init] + in_nodes + zeros_like_outs)
+
+  cond_subc = xb.make_computation_builder("remat_cond_subcomputation")
+  input_op = xb.parameter(cond_subc, 0, c.get_shape(inputs), replicated=[])
+  i = xops.GetTupleElement(input_op, 0)
+  rng = xops.RngUniform(xb.constant(cond_subc, np.array(1, dtype=np.int32)),
+                        xb.constant(cond_subc, np.array(2, dtype=np.int32)),
+                        xc.Shape.array_shape(xc.PrimitiveType.S32, []))
+  cond_subc = cond_subc.build(xops.Lt(i, rng))
+
+  body_subc = xb.make_computation_builder("remat_body_subcomputation")
+  input_op = xb.parameter(body_subc, 0, c.get_shape(inputs), replicated=[])
+  i, *args = xla_destructure(body_subc, input_op)[:len(in_nodes)+1]
+  i_next = xops.Add(i, xb.constant(body_subc, np.array(1, dtype=np.int32)))
+  subcomp_outs = jaxpr_subcomp(
+      body_subc, call_jaxpr, backend, axis_env, (),
+      extend_name_stack(name_stack, wrap_name(name, "remat")), *args)
+  out_nodes = [i_next] + args + subcomp_outs
+  body_subc = body_subc.build(xops.Tuple(body_subc, out_nodes))
+  outs = xops.While(cond_subc, body_subc, inputs)
+  return xops.Tuple(c, xla_destructure(c, outs)[len(in_nodes)+1:])
+
+
+def _remat_translation_rule(c, axis_env, in_nodes,
+                            name_stack, backend, name, call_jaxpr,
+                            device=None, concrete=None):
+  del device, concrete  # Unused.
+  if backend == "gpu":
+    return _remat_using_while(
+        c, axis_env, in_nodes, name_stack, backend, name, call_jaxpr)
+  else:
+    return _remat_using_cond(
+        c, axis_env, in_nodes, name_stack, backend, name, call_jaxpr)
+
 call_translations[pe.remat_call_p] = _remat_translation_rule  # type: ignore
 
 

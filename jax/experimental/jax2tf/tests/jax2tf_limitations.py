@@ -15,7 +15,7 @@
 
 import itertools
 import numpy as np
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, Union
 
 from jax import dtypes
 from jax import lax
@@ -35,8 +35,8 @@ class Jax2TfLimitation(primitive_harness.Limitation):
       self,
       description: str,
       *,
-      devices: Sequence[str] = ("cpu", "gpu", "tpu"),
-      dtypes: Sequence[DType] = (),
+      devices: Union[str, Sequence[str]] = ("cpu", "gpu", "tpu"),
+      dtypes: Union[DType, Sequence[DType]] = (),
       enabled: bool = True,
       # jax2tf specific
       modes=("eager", "graph", "compiled"),
@@ -313,6 +313,7 @@ class Jax2TfLimitation(primitive_harness.Limitation):
         Jax2TfLimitation(
             "jax2tf BUG: batch_group_count > 1 not yet converted",
             enabled=(harness.params["batch_group_count"] > 1)),
+        missing_tf_kernel(dtypes=[np.complex64, np.complex128], devices="gpu"),
         custom_numeric(devices="gpu", tol=1e-4),
         custom_numeric(devices="tpu", tol=1e-3),
         # TODO(bchetioui): significant discrepancies in some float16 cases.
@@ -322,7 +323,7 @@ class Jax2TfLimitation(primitive_harness.Limitation):
         custom_numeric(dtypes=np.float32, devices="gpu", tol=1e-3),
         custom_numeric(dtypes=np.float32, devices="cpu", tol=1e-4),
         custom_numeric(dtypes=np.complex64, devices="tpu", tol=0.1),
-        custom_numeric(dtypes=[np.complex64, np.complex128], devices=("cpu", "gpu"), tol=5e-4),
+        custom_numeric(dtypes=(np.complex64, np.complex128), devices=("cpu", "gpu"), tol=5e-4),
         # TODO(bchetioui): slight discrepancy when going through the path using
         # tf.nn.convolution.
         custom_numeric(dtypes=np.float64, devices="cpu", tol=1e-13),
@@ -455,7 +456,10 @@ class Jax2TfLimitation(primitive_harness.Limitation):
                 np.int16
             ],),
         missing_tf_kernel(
-            dtypes=[np.int64], devices=("cpu", "gpu"), modes="compiled"),
+            dtypes=np.int64, devices=("cpu", "gpu"),
+            modes="compiled",
+            # Works for 2D matrices.
+            enabled=(len(harness.params["lhs_shape"]) > 2)),
         custom_numeric(dtypes=dtypes.bfloat16, tol=0.3),
         custom_numeric(
             dtypes=[np.complex64, np.float32], devices=("cpu", "gpu"),
@@ -534,7 +538,6 @@ class Jax2TfLimitation(primitive_harness.Limitation):
   @classmethod
   def eigh(cls, harness: primitive_harness.Harness):
     dtype = harness.dtype
-    shape = harness.params["shape"]
 
     def custom_assert(tst, result_jax, result_tf, *, args, tol):
       operand, = args
@@ -545,24 +548,26 @@ class Jax2TfLimitation(primitive_harness.Limitation):
         # TODO(bchetioui): tolerance needs to be very high in compiled mode,
         # specifically for eigenvectors.
         if dtype == np.float64:
-          tol = 1e-6
+          tol = 2e-5
         elif dtype == np.float32:
           tol = 1e-2
         elif dtype in [dtypes.bfloat16, np.complex64]:
           tol = 1e-3
         elif dtype == np.complex128:
-          tol = 1e-13
+          tol = 2e-5
         tst.assertAllClose(
             np.matmul(a, vr) - w[..., None, :] * vr,
             np.zeros(a.shape, dtype=vr.dtype),
-            atol=tol)
+            atol=tol,
+            # For bfloat16 the np.matmul returns float32 result.
+            check_dtypes=False)
 
       def check_eigenvalue_is_in_array(eigenvalue, eigenvalues_array):
         tol = None
         if dtype in [dtypes.bfloat16, np.float32, np.complex64]:
           tol = 1e-3
         elif dtype in [np.float64, np.complex128]:
-          tol = 1e-11
+          tol = 1e-5
         closest_diff = min(abs(eigenvalues_array - eigenvalue))
         tst.assertAllClose(
             closest_diff, np.array(0., closest_diff.dtype), atol=tol)
@@ -580,22 +585,27 @@ class Jax2TfLimitation(primitive_harness.Limitation):
 
     return [
         # See https://github.com/google/jax/pull/3775#issuecomment-659407824;
+        # TODO(b/181414529): enable after XLA/GPU bug is fixed.
         Jax2TfLimitation(
-            "function not compilable",
-            dtypes=[np.complex64, np.complex128],
+            "XLA lowering bug",
+            dtypes=(np.complex64, np.complex128),
+            devices=("gpu",),
             modes="compiled",
-            enabled=(shape[0] > 0)),
+            skip_tf_run=True),
+        missing_tf_kernel(
+            dtypes=dtypes.bfloat16,
+            devices="tpu",
+            enabled=(harness.params["shape"] != (0, 0)),  # This actually works!
+            ),
+        Jax2TfLimitation(
+            "function not yet compilable",
+            dtypes=(np.complex64, np.complex128),
+            modes="compiled",
+            skip_tf_run=True),
         Jax2TfLimitation(
             "TODO: numeric discrepancies",
-            dtypes=[np.float64],
-            modes="compiled",
-            devices=("cpu", "gpu"),
-            expect_tf_error=False,
-            skip_comparison=True),
-        Jax2TfLimitation(
-            "TODO: numeric discrepancies",
-            dtypes=[np.float16],
-            devices=("tpu",),
+            dtypes=np.float16,
+            devices="tpu",
             expect_tf_error=False,
             skip_comparison=True),
         custom_numeric(
@@ -720,7 +730,8 @@ class Jax2TfLimitation(primitive_harness.Limitation):
           np.full((nr_special_cases,), 0., dtype=dtype),
           result_tf[special_cases])
       # non-special cases are equal
-      tst.assertAllClose(result_jax[~special_cases], result_tf[~special_cases])
+      tst.assertAllClose(result_jax[~special_cases], result_tf[~special_cases],
+                         atol=tol, rtol=tol)
 
     return [
         missing_tf_kernel(
@@ -927,12 +938,7 @@ class Jax2TfLimitation(primitive_harness.Limitation):
 
   @classmethod
   def population_count(cls, harness: primitive_harness.Harness):
-    return [
-        missing_tf_kernel(
-            dtypes=[np.uint32, np.uint64],
-            devices=("cpu", "gpu"),
-            modes=("eager", "graph"))
-    ]
+    return []
 
   @classmethod
   def qr(cls, harness: primitive_harness.Harness):
@@ -943,7 +949,7 @@ class Jax2TfLimitation(primitive_harness.Limitation):
     #   compiling with TF is expected to have worse performance than the
     #   custom calls made in JAX.
     return [
-        custom_numeric(tol=1e-5),
+        custom_numeric(tol=1e-4),
         missing_tf_kernel(
             dtypes=[dtypes.bfloat16],
             devices="tpu",
@@ -1257,11 +1263,13 @@ def missing_tf_kernel(
     description="op not defined for dtype",
     dtypes,
     modes=("eager", "graph", "compiled"),
-    devices=("cpu", "gpu", "tpu")
+    devices=("cpu", "gpu", "tpu"),
+    enabled=True
 ) -> Jax2TfLimitation:
 
   return Jax2TfLimitation(
       description,
       dtypes=dtypes,
       devices=devices,
-      modes=modes)
+      modes=modes,
+      enabled=enabled)

@@ -293,8 +293,8 @@ class Limitation:
       description: str,
       *,
       enabled: bool = True,
-      devices: Sequence[str] = ("cpu", "gpu", "tpu"),
-      dtypes: Sequence[DType] = (),
+      devices: Union[str, Sequence[str]] = ("cpu", "gpu", "tpu"),
+      dtypes: Union[DType, Sequence[DType]] = (),
       skip_run: bool = False,
   ):
     """Args:
@@ -475,7 +475,7 @@ def _make_convert_element_type_harness(name,
   define(
     "convert_element_type",
     f"{name}_shape={jtu.format_shape_dtype_string(shape, dtype)}_olddtype={jtu.dtype_str(dtype)}_newdtype={jtu.dtype_str(new_dtype)}",
-    lambda arg: (lax.convert_element_type_p.bind(arg, new_dtype=new_dtype)),
+    lambda arg: (lax.convert_element_type_p.bind(arg, new_dtype=new_dtype, weak_type=False)),
     [RandArg(shape, dtype)],
     shape=shape,
     dtype=dtype,
@@ -1527,12 +1527,6 @@ def _make_fft_harness(name,
     [RandArg(shape, dtype),
      StaticArg(fft_type),
      StaticArg(fft_lengths)],
-    jax_unimplemented=[
-      Limitation(
-        "only 1D FFT is currently supported b/140351181.",
-        devices="tpu",
-        enabled=len(fft_lengths) > 1),
-    ],
     rng_factory=_fft_rng_factory(dtype),
     shape=shape,
     dtype=dtype,
@@ -1659,7 +1653,7 @@ for dtype in jtu.dtypes.all_inexact:
             devices="tpu",
             dtypes=[np.complex64, np.complex128]),
           Limitation(
-            "unimplemented", devices=("cpu", "gpu", "tpu"),
+            "unimplemented", devices=("cpu", "gpu"),
             dtypes=[np.float16, dtypes.bfloat16]),
         ],
         shape=shape,

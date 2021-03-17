@@ -17,6 +17,18 @@ import os as _os
 _os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '1')
 del _os
 
+# Set Cloud TPU env vars if necessary before transitively loading C++ backend
+from .cloud_tpu_init import cloud_tpu_init as _cloud_tpu_init
+try:
+  _cloud_tpu_init()
+except Exception as exc:
+  # Defensively swallow any exceptions to avoid making jax unimportable
+  from warnings import warn as _warn
+  _warn(f"cloud_tpu_init failed: {repr(exc)}\n This a JAX bug; please report "
+        f"an issue at https://github.com/google/jax/issues")
+  del _warn
+del _cloud_tpu_init
+
 # flake8: noqa: F401
 from .config import config
 from .api import (
@@ -31,6 +43,7 @@ from .api import (
   custom_jvp,
   custom_vjp,
   custom_transforms,
+  default_backend,
   defjvp,
   defjvp_all,
   defvjp,
@@ -91,6 +104,7 @@ from .version import __version__
 
 # These submodules are separate because they are in an import cycle with
 # jax and rely on the names imported above.
+from . import errors
 from . import image
 from . import lax
 from . import nn

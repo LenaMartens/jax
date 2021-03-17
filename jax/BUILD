@@ -103,6 +103,13 @@ pytype_library(
 )
 
 pytype_library(
+    name = "pjit",
+    srcs = ["experimental/pjit.py"],
+    srcs_version = "PY3",
+    deps = [":jax"],
+)
+
+pytype_library(
     name = "jet",
     srcs = ["experimental/jet.py"],
     srcs_version = "PY3",
@@ -123,4 +130,11 @@ pytype_library(
     deps = [
         ":jax",
     ],
+)
+
+pytype_library(
+    name = "djax",
+    srcs = ["experimental/djax.py"],
+    srcs_version = "PY3",
+    deps = [":jax"],
 )

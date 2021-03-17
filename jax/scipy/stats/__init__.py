@@ -29,3 +29,4 @@ from . import poisson
 from . import t
 from . import uniform
 from . import chi2
+from . import betabinom

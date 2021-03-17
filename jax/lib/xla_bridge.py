@@ -144,7 +144,9 @@ register_backend('xla', _get_local_backend)
 _tpu_backend = None
 
 def _get_tpu_driver_backend(platform):
-  del platform
+  if platform == "cpu":
+    return _get_local_backend("cpu")
+
   global _tpu_backend
   if _tpu_backend is None:
     backend_target = FLAGS.jax_backend_target
@@ -228,6 +230,11 @@ def devices(backend: Optional[str] = None) -> List[xla_client.Device]:
   return get_backend(backend).devices()
 
 
+def default_backend() -> str:
+  """Returns the platform name of the default XLA backend."""
+  return get_backend(None).platform
+
+
 def local_devices(host_id: Optional[int] = None,
                   backend: Optional[str] = None) -> List[xla_client.Device]:
   """Like :py:func:`jax.devices`, but only returns devices local to a given host.
@@ -282,7 +289,7 @@ def host_count(backend: Optional[str] = None) -> int:
 
 @util.memoize
 def dtype_to_etype(dtype):
-  """Convert from dtype to canonical etype (reading FLAGS.jax_enable_x64)."""
+  """Convert from dtype to canonical etype (reading config.x64_enabled)."""
   return xla_client.dtype_to_etype(dtypes.canonicalize_dtype(dtype))
 
 

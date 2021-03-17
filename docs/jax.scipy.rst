@@ -47,6 +47,7 @@ jax.scipy.optimize
   :toctree: _autosummary
 
    minimize
+   OptimizeResults
 
 jax.scipy.signal
 ----------------
@@ -129,6 +130,16 @@ jax.scipy.stats.beta
    logpdf
    pdf
 
+jax.scipy.stats.betabinom
+~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.betabinom
+
+.. autosummary::
+  :toctree: _autosummary
+
+   logpmf
+   pmf
+
 jax.scipy.stats.cauchy
 ~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: jax.scipy.stats.cauchy
@@ -140,7 +151,7 @@ jax.scipy.stats.cauchy
    pdf
 
 jax.scipy.stats.chi2
-~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~
 .. automodule:: jax.scipy.stats.chi2
 
 .. autosummary::

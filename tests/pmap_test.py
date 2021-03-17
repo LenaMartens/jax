@@ -33,6 +33,7 @@ import jax.numpy as jnp
 from jax import test_util as jtu
 from jax import tree_util
 from jax import lax
+from jax._src.lax import parallel
 from jax import random
 from jax.core import ShapedArray
 from jax import (pmap, soft_pmap, jit, vmap, jvp, grad, make_jaxpr,
@@ -214,6 +215,7 @@ class PmapTest(jtu.JaxTestCase):
       {"testcase_name": f"_split={split_axis}_concat={concat_axis}",
       "split_axis": split_axis, "concat_axis": concat_axis}
       for split_axis, concat_axis in it.product(range(2), range(2)))
+  @ignore_slow_all_to_all_warning()
   def testAllToAll(self, split_axis, concat_axis):
     if not config.omnistaging_enabled:
       self.skipTest("all_to_all doesn't work without omnistaging")
@@ -236,6 +238,7 @@ class PmapTest(jtu.JaxTestCase):
       {"testcase_name": f"_split={split_axis}_concat={concat_axis}",
        "split_axis": split_axis, "concat_axis": concat_axis}
       for split_axis, concat_axis in it.product(range(2), range(2)))
+  @ignore_slow_all_to_all_warning()
   def testAllToAllSplitAxis(self, split_axis, concat_axis):
     if not config.omnistaging_enabled:
       self.skipTest("all_to_all doesn't work without omnistaging")
@@ -615,6 +618,7 @@ class PmapTest(jtu.JaxTestCase):
 
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  @ignore_slow_all_to_all_warning()
   def testGradOfGather(self):
     if not config.omnistaging_enabled:
       self.skipTest("all_to_all doesn't work without omnistaging")
@@ -1143,6 +1147,7 @@ class PmapTest(jtu.JaxTestCase):
     self.assertAllClose(expected_bz1, bz1, check_dtypes=False)
     self.assertAllClose(bz2, bz2, check_dtypes=False)
 
+  @ignore_slow_all_to_all_warning()
   def testPswapaxes(self):
     if not config.omnistaging_enabled:
       self.skipTest("all_to_all doesn't work without omnistaging")
@@ -1154,6 +1159,7 @@ class PmapTest(jtu.JaxTestCase):
     expected = np.swapaxes(x, 0, 2)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  @ignore_slow_all_to_all_warning()
   def testGradOfPswapaxes(self):
     if not config.omnistaging_enabled:
       self.skipTest("all_to_all doesn't work without omnistaging")
@@ -1171,6 +1177,7 @@ class PmapTest(jtu.JaxTestCase):
     expected = np.tile(w, reps=device_count).reshape(shape)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+  @ignore_slow_all_to_all_warning()
   def testAllToAllReplicaGroups(self):
     if not config.omnistaging_enabled:
       self.skipTest("all_to_all doesn't work without omnistaging")
@@ -1201,6 +1208,7 @@ class PmapTest(jtu.JaxTestCase):
         1, 2).reshape(shape)
     self.assertAllClose(fn(x), expected, check_dtypes=False)
 
+  @ignore_slow_all_to_all_warning()
   def testGradOfAllToAllReplicaGroups(self):
     if not config.omnistaging_enabled:
       self.skipTest("all_to_all doesn't work without omnistaging")
@@ -1236,7 +1244,7 @@ class PmapTest(jtu.JaxTestCase):
     bufs = pxla.device_put(shard, xla_bridge.devices()[:4], replicate=True)
     aval = ShapedArray((6,4), shard.dtype)
     sharding_spec = pxla.ShardingSpec(
-        sharding=map(pxla.Chunked, (2, 2)),
+        sharding=map(pxla.Chunked, ([2], [2])),
         mesh_mapping=map(pxla.ShardedAxis, (0, 1)))
     arr = pxla.ShardedDeviceArray(aval, sharding_spec, bufs)
 
@@ -1631,6 +1639,9 @@ class PmapTest(jtu.JaxTestCase):
 
   @jtu.skip_on_devices("cpu")
   def test_replicate_backend(self):
+    # TODO(skye): fix backend caching so we always have multiple CPUs available
+    if jax.device_count("cpu") < 4:
+      self.skipTest("test requires 4 CPU device")
     # https://github.com/google/jax/issues/4223
     def fn(indices):
       return jnp.equal(indices, jnp.arange(3)).astype(jnp.float32)
@@ -1652,6 +1663,37 @@ class PmapTest(jtu.JaxTestCase):
     y = jnp.arange(num_devices * 5).reshape(num_devices, 5)
     z = pmap(f, axis_name='i', out_axes=None)(x, y)
     self.assertAllClose(z, jnp.dot(x.T, y))
+
+  @parameterized.named_parameters(
+      {"testcase_name": "_shape={}_axis={}_collective={}".format(
+          jtu.format_shape_dtype_string(shape, dtype),
+          axis, collective.__name__.replace(" ", "")),
+       "shape": shape, "dtype": dtype, "axis": axis,
+       "collective": collective, "bulk_op": bulk_op}
+      for collective, bulk_op in [
+          (parallel.pargmax, jnp.argmax),
+          (parallel.pargmin, jnp.argmin)
+      ]
+      for dtype in [np.float32, np.int32]
+      for shape in [(4,), (2, 2), (2, 4), (4, 2)]
+      for axis in range(len(shape))
+  )
+  def testArgAllReduce(self, shape, dtype, axis, collective, bulk_op):
+    if not config.omnistaging_enabled:
+      self.skipTest("test requires omnistaging")
+    if xla_bridge.device_count() < shape[axis]:
+      raise SkipTest(f"test requires at least {shape[axis]} devices")
+    if (jtu.device_under_test() == 'cpu' and
+        np.issubdtype(dtype, np.floating) and
+        len(shape) > 1):
+      raise SkipTest("skipped on cpu due to strange failures")  # TODO(mattjj)
+
+    rng = jtu.rand_default(self.rng())
+    x = rng(shape, dtype)
+    ans = pmap(lambda x: collective(x, 'i'), in_axes=axis, out_axes=None,
+               axis_name='i')(x)
+    expected = bulk_op(x, axis=axis)
+    self.assertAllClose(ans, expected, check_dtypes=False)
 
 
 class VmapOfPmapTest(jtu.JaxTestCase):
@@ -2179,7 +2221,7 @@ class SpecToIndicesTest(jtu.JaxTestCase):
 
   def testShardsPerAxis(self):
     shape = (4, 8)
-    spec = pxla.ShardingSpec(sharding=map(pxla.Chunked, (2, 2)),
+    spec = pxla.ShardingSpec(sharding=map(pxla.Chunked, ([2], [2])),
                              mesh_mapping=map(pxla.ShardedAxis, (0, 1)))
     self.assertEqual(pxla.spec_to_indices(shape, spec),
                      ((slice(0,2), slice(0,4)),
@@ -2189,7 +2231,7 @@ class SpecToIndicesTest(jtu.JaxTestCase):
 
   def testShardedAxisPermutation(self):
     shape = (4, 8)
-    spec = pxla.ShardingSpec(sharding=map(pxla.Chunked, (2, 2)),
+    spec = pxla.ShardingSpec(sharding=map(pxla.Chunked, ([2], [2])),
                              mesh_mapping=map(pxla.ShardedAxis, (1, 0)))
     self.assertEqual(pxla.spec_to_indices(shape, spec),
                      ((slice(0,2), slice(0,4)),
@@ -2199,7 +2241,7 @@ class SpecToIndicesTest(jtu.JaxTestCase):
 
   def testShardedAxisPermutationAndReplication(self):
     shape = (4, 8)
-    spec = pxla.ShardingSpec(sharding=map(pxla.Chunked, (2, 2)),
+    spec = pxla.ShardingSpec(sharding=map(pxla.Chunked, ([2], [2])),
                              mesh_mapping=(pxla.Replicated(2),
                                            pxla.ShardedAxis(1),
                                            pxla.ShardedAxis(0)))
@@ -2211,7 +2253,7 @@ class SpecToIndicesTest(jtu.JaxTestCase):
 
   def testUnshardedAxis(self):
     shape = (4, 8)
-    spec = pxla.ShardingSpec(sharding=(pxla.Chunked(2), pxla.NoSharding()),
+    spec = pxla.ShardingSpec(sharding=(pxla.Chunked([2]), pxla.NoSharding()),
                              mesh_mapping=(pxla.ShardedAxis(0),))
     self.assertEqual(pxla.spec_to_indices(shape, spec),
                      ((slice(0,2), slice(None)),
@@ -2250,7 +2292,7 @@ class SpecToIndicesTest(jtu.JaxTestCase):
 
   def testReplicationPosition2(self):
     shape = (2, 8)
-    spec = pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.Chunked(2)),
+    spec = pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.Chunked([2])),
                              mesh_mapping=(pxla.ShardedAxis(0), pxla.ShardedAxis(1), pxla.Replicated(3)))
     self.assertEqual(pxla.spec_to_indices(shape, spec),
                      ((0, slice(0, 4)), (0, slice(0, 4)), (0, slice(0, 4)),
@@ -2260,7 +2302,7 @@ class SpecToIndicesTest(jtu.JaxTestCase):
 
   def testReplicationPosition1(self):
     shape = (2, 8)
-    spec = pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.Chunked(2)),
+    spec = pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.Chunked([2])),
                              mesh_mapping=(pxla.ShardedAxis(0), pxla.Replicated(3), pxla.ShardedAxis(1)))
     self.assertEqual(pxla.spec_to_indices(shape, spec),
                      ((0, slice(0, 4)), (0, slice(4, 8)),
@@ -2280,7 +2322,7 @@ class SpecToIndicesTest(jtu.JaxTestCase):
   def testMultipleReplications(self):
     shape = (2, 7, 4)
     spec = pxla.ShardingSpec(
-        sharding=(pxla.Unstacked(2), pxla.NoSharding(), pxla.Chunked(2)),
+        sharding=(pxla.Unstacked(2), pxla.NoSharding(), pxla.Chunked([2])),
         mesh_mapping=(pxla.Replicated(3), pxla.Replicated(2),
                       pxla.ShardedAxis(0), pxla.Replicated(2),
                       pxla.ShardedAxis(1)))
@@ -2331,16 +2373,16 @@ class ShardArgsTest(jtu.JaxTestCase):
           [(4, 8), pxla.ShardingSpec(sharding=(pxla.NoSharding(), pxla.NoSharding()),
                                      mesh_mapping=())],
           # partitioned, 1 axis
-          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked(2), pxla.NoSharding()),
+          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked([2]), pxla.NoSharding()),
                                      mesh_mapping=(pxla.ShardedAxis(0),))],
           # partitioned, 2 axes
-          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked(2), pxla.Chunked(2)),
+          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked([2]), pxla.Chunked([2])),
                                      mesh_mapping=map(pxla.ShardedAxis, (0, 1)))],
           # partitioned, 2 axes, permuted
-          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked(2), pxla.Chunked(2)),
+          [(4, 8), pxla.ShardingSpec(sharding=(pxla.Chunked([2]), pxla.Chunked([2])),
                                      mesh_mapping=map(pxla.ShardedAxis, (1, 0)))],
           # partitioned + sharding
-          [(2, 8), pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.Chunked(2)),
+          [(2, 8), pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.Chunked([2])),
                                      mesh_mapping=map(pxla.ShardedAxis, (0, 1)))],
           # replication + sharding
           [(2, 8), pxla.ShardingSpec(sharding=(pxla.Unstacked(2), pxla.NoSharding()),
@@ -2349,7 +2391,7 @@ class ShardArgsTest(jtu.JaxTestCase):
           [(2, 8), pxla.ShardingSpec(sharding=(pxla.NoSharding(), pxla.NoSharding()),
                                      mesh_mapping=(pxla.Replicated(3),))],
           # multiple replicated axes
-          [(1, 8), pxla.ShardingSpec(sharding=(pxla.Unstacked(1), pxla.Chunked(2)),
+          [(1, 8), pxla.ShardingSpec(sharding=(pxla.Unstacked(1), pxla.Chunked([2])),
                                      mesh_mapping=(pxla.Replicated(2), pxla.ShardedAxis(0),
                                                    pxla.Replicated(2), pxla.ShardedAxis(1)))],
           # replicated scalar
@@ -2365,10 +2407,10 @@ class ShardArgsTest(jtu.JaxTestCase):
     arg = make_arg(x)
     bufs = pxla.shard_args(jax.devices()[:nshards],
                            [indices], [arg])
-    self.assertEqual(len(bufs), nshards)
-    for buf, idx in zip(bufs, indices):
-      self.assertEqual(len(buf), 1)
-      self.assertAllClose(buf[0].to_py(), x[idx], check_dtypes=False)
+    self.assertEqual(len(bufs), 1)
+    self.assertEqual(len(bufs[0]), nshards)
+    for buf, idx in zip(bufs[0], indices):
+      self.assertAllClose(buf.to_py(), x[idx], check_dtypes=False)
 
 
 if __name__ == '__main__':

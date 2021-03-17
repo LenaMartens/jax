@@ -20,8 +20,7 @@
 
 ## What is JAX?
 
-JAX is [Autograd](https://github.com/hips/autograd) and
-[XLA](https://www.tensorflow.org/xla),
+JAX is [Autograd](https://github.com/hips/autograd) and [XLA](https://www.tensorflow.org/xla),
 brought together for high-performance machine learning research.
 
 With its updated version of [Autograd](https://github.com/hips/autograd),
@@ -32,8 +31,7 @@ derivatives. It supports reverse-mode differentiation (a.k.a. backpropagation)
 via [`grad`](#automatic-differentiation-with-grad) as well as forward-mode differentiation,
 and the two can be composed arbitrarily to any order.
 
-What’s new is that JAX uses
-[XLA](https://www.tensorflow.org/xla)
+What’s new is that JAX uses [XLA](https://www.tensorflow.org/xla)
 to compile and run your NumPy programs on GPUs and TPUs. Compilation happens
 under the hood by default, with library calls getting just-in-time compiled and
 executed. But JAX also lets you just-in-time compile your own Python functions
@@ -220,15 +218,15 @@ function:
 ```python
 def predict(params, input_vec):
   assert input_vec.ndim == 1
-  activations = inputs
+  activations = input_vec
   for W, b in params:
-    outputs = jnp.dot(W, activations) + b  # `input_vec` on the right-hand side!
+    outputs = jnp.dot(W, activations) + b  # `activations` on the right-hand side!
     activations = jnp.tanh(outputs)
   return outputs
 ```
 
-We often instead write `jnp.dot(inputs, W)` to allow for a batch dimension on the
-left side of `inputs`, but we’ve written this particular prediction function to
+We often instead write `jnp.dot(activations, W)` to allow for a batch dimension on the
+left side of `activations`, but we’ve written this particular prediction function to
 apply only to single input vectors. If we wanted to apply this function to a
 batch of inputs at once, semantically we could just write
 
@@ -312,7 +310,7 @@ print(normalize(jnp.arange(4.)))
 # prints [0.         0.16666667 0.33333334 0.5       ]
 ```
 
-You can even [nest `pmap` functions](https://colab.sandbox.google.com/github/google/jax/blob/master/cloud_tpu_colabs/Pmap_Cookbook.ipynb#scrollTo=MdRscR5MONuN) for more
+You can even [nest `pmap` functions](https://colab.research.google.com/github/google/jax/blob/master/cloud_tpu_colabs/Pmap_Cookbook.ipynb#scrollTo=MdRscR5MONuN) for more
 sophisticated communication patterns.
 
 It all composes, so you're free to differentiate through parallel computations:
@@ -345,7 +343,7 @@ When reverse-mode differentiating a `pmap` function (e.g. with `grad`), the
 backward pass of the computation is parallelized just like the forward pass.
 
 See the [SPMD
-Cookbook](https://colab.sandbox.google.com/github/google/jax/blob/master/cloud_tpu_colabs/Pmap_Cookbook.ipynb)
+Cookbook](https://colab.research.google.com/github/google/jax/blob/master/cloud_tpu_colabs/Pmap_Cookbook.ipynb)
 and the [SPMD MNIST classifier from scratch
 example](https://github.com/google/jax/blob/master/examples/spmd_mnist_classifier_fromscratch.py)
 for more.
@@ -424,13 +422,13 @@ Next, run
 
 ```bash
 pip install --upgrade pip
-pip install --upgrade jax jaxlib==0.1.60+cuda110 -f https://storage.googleapis.com/jax-releases/jax_releases.html
+pip install --upgrade jax jaxlib==0.1.62+cuda110 -f https://storage.googleapis.com/jax-releases/jax_releases.html
 ```
 
 The jaxlib version must correspond to the version of the existing CUDA
-installation you want to use, with `cuda111` for CUDA 11.1, `cuda110` for CUDA
-11.0, `cuda102` for CUDA 10.2, and `cuda101` for CUDA 10.1. You can find your
-CUDA version with the command:
+installation you want to use, with `cuda112` for CUDA 11.2, `cuda111` for CUDA
+11.1, `cuda110` for CUDA 11.0, `cuda102` for CUDA 10.2, and `cuda101` for CUDA
+10.1. You can find your CUDA version with the command:
 
 ```bash
 nvcc --version
@@ -471,11 +469,12 @@ models and reinforcement learning. Finally,
 [Objax](https://github.com/google/objax) is a minimalist object-oriented
 framework with a PyTorch-like interface.
 
-DeepMind has open-sourced an ecosystem of libraries around JAX including
-[Haiku](https://github.com/deepmind/dm-haiku) for neural network modules,
-[Optax](https://github.com/deepmind/optax) for gradient processing and
-optimization, [RLax](https://github.com/deepmind/rlax) for RL algorithms, and
-[chex](https://github.com/deepmind/chex) for reliable code and testing.
+DeepMind has open-sourced an
+[ecosystem of libraries around JAX](https://deepmind.com/blog/article/using-jax-to-accelerate-our-research) including [Haiku](https://github.com/deepmind/dm-haiku) for neural
+network modules, [Optax](https://github.com/deepmind/optax) for gradient
+processing and optimization, [RLax](https://github.com/deepmind/rlax) for RL
+algorithms, and [chex](https://github.com/deepmind/chex) for reliable code and
+testing. (Watch the NeurIPS 2020 JAX Ecosystem at DeepMind talk [here](https://www.youtube.com/watch?v=iDxJxIyzSiM))
 
 ## Citing JAX
 
