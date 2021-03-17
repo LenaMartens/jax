@@ -22,6 +22,7 @@ from .config import config
 from .api import (
   ad,  # TODO(phawkins): update users to avoid this.
   argnums_partial,  # TODO(phawkins): update Haiku to not use this.
+  checking_leaks,
   checkpoint,
   closure_convert,
   curry,  # TODO(phawkins): update users to avoid this.
